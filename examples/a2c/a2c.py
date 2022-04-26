@@ -1,3 +1,6 @@
+from torchrl.agents.helpers.collectors import \
+    make_collector_offpolicy_singleprocess
+
 try:
     import configargparse as argparse
 
@@ -97,7 +100,7 @@ def A2C(rank, world_size, args):
 
     create_env_fn = parallel_env_constructor(args=args, stats=stats)
 
-    collector = make_collector_offpolicy(
+    collector = make_collector_offpolicy_singleprocess(
         make_env=create_env_fn,
         actor_model_explore=model_explore,
         args=args,

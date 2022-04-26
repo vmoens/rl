@@ -10,7 +10,7 @@ from torchrl.collectors.collectors import (
     _DataCollector,
     _MultiDataCollector,
     MultiaSyncDataCollector,
-    MultiSyncDataCollector,
+    MultiSyncDataCollector, SyncDataCollector,
 )
 from torchrl.data import MultiStep
 from torchrl.data.tensordict.tensordict import _TensorDict
@@ -297,6 +297,56 @@ def make_collector_offpolicy(
     }
 
     collector = collector_helper(**collector_helper_kwargs)
+    collector.set_seed(args.seed)
+    return collector
+
+def make_collector_offpolicy_singleprocess(
+    make_env: Callable[[], _EnvClass],
+    actor_model_explore: Union[TDModuleWrapper, ProbabilisticTDModule],
+    args: Namespace,
+    make_env_kwargs=None,
+) -> _DataCollector:
+    """
+    Returns a data collector for off-policy algorithms.
+
+    Args:
+        make_env (Callable): environment creator
+        actor_model_explore (TDModule): Model instance used for evaluation and exploration update
+        args (Namespace): argument namespace built from the parser constructor
+        make_env_kwargs (dict): kwargs for the env creator
+
+    """
+    if args.multi_step:
+        ms = MultiStep(
+            gamma=args.gamma,
+            n_steps_max=args.n_steps_return,
+        )
+    else:
+        ms = None
+
+    env_kwargs = {}
+    if make_env_kwargs is not None:
+        env_kwargs.update(make_env_kwargs)
+    args.collector_devices = args.collector_devices[0]
+    collector_helper_kwargs = {
+        "create_env_fn": make_env,
+        "env_kwargs": env_kwargs,
+        "policy": actor_model_explore,
+        "max_frames_per_traj": args.max_frames_per_traj,
+        "frames_per_batch": args.frames_per_batch,
+        "total_frames": args.total_frames,
+        "postproc": ms,
+        "device": args.collector_devices,
+        "passing_devices": args.collector_devices,
+        "init_random_frames": args.init_random_frames,
+        "pin_memory": args.pin_memory,
+        "split_trajs": ms is not None,
+        # trajectories must be separated if multi-step is used
+        "init_with_lag": args.init_with_lag,
+        "exploration_mode": args.exploration_mode,
+    }
+
+    collector = SyncDataCollector(**collector_helper_kwargs)
     collector.set_seed(args.seed)
     return collector
 
