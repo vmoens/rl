@@ -337,7 +337,7 @@ def make_collector_offpolicy_singleprocess(
         "total_frames": args.total_frames,
         "postproc": ms,
         "device": args.collector_devices,
-        "passing_devices": args.collector_devices,
+        "passing_device": args.collector_devices,
         "init_random_frames": args.init_random_frames,
         "pin_memory": args.pin_memory,
         "split_trajs": ms is not None,
