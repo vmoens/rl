@@ -16,4 +16,4 @@ record_frames=50000
 from_pixels
 record_video
 num_workers=8
-num_envs_per_collector=8
+envs_per_collector=8
