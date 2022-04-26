@@ -121,14 +121,14 @@ def A2C(rank, world_size, args):
         else:
             recorder_rm = recorder
         recorder_rm.load_state_dict(create_env_fn.state_dict()["worker0"])
+        # reset reward scaling
+        for t in recorder.transform:
+            if isinstance(t, RewardScaling):
+                t.scale.fill_(1.0)
 
     else:
         recorder = None
 
-    # reset reward scaling
-    for t in recorder.transform:
-        if isinstance(t, RewardScaling):
-            t.scale.fill_(1.0)
 
     # make the loss
     loss_module, target_net_updater = make_dqn_loss(model, args)
