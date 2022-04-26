@@ -330,7 +330,7 @@ def make_collector_offpolicy_singleprocess(
     args.collector_devices = args.collector_devices[0]
     collector_helper_kwargs = {
         "create_env_fn": make_env,
-        "env_kwargs": env_kwargs,
+        "create_env_kwargs": env_kwargs,
         "policy": actor_model_explore,
         "max_frames_per_traj": args.max_frames_per_traj,
         "frames_per_batch": args.frames_per_batch,
