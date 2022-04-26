@@ -48,11 +48,8 @@ def A2C(rank, world_size, args):
     if not isinstance(args.reward_scaling, float):
         args.reward_scaling = 1.0
 
-    device = (
-        torch.device("cpu")
-        if torch.cuda.device_count() == 0
-        else torch.device("cuda:0")
-    )
+    device = torch.device(f"cuda:{rank}")
+    args.collector_devices = [device]
 
     replay_buffer = None  # no RB for A2C
 
