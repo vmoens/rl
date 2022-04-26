@@ -77,7 +77,6 @@ def A2C(rank, world_size, args):
         args=args,
         device=device,
     )
-    model = DDP(model, device_ids=[rank])
 
     # make the policy
     model_explore = EGreedyWrapper(model, annealing_num_steps=args.annealing_frames).to(
@@ -132,6 +131,7 @@ def A2C(rank, world_size, args):
 
     # make the loss
     loss_module, target_net_updater = make_dqn_loss(model, args)
+    loss_module = DDP(loss_module, device_ids=[rank])
 
     # make the agent
     agent = make_agent(
