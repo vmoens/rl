@@ -276,6 +276,8 @@ class SyncDataCollector(_DataCollector):
         self.reset_at_each_iter = reset_at_each_iter
         self.init_random_frames = init_random_frames
         self.postproc = postproc
+        self.passing_device = torch.device(passing_device)
+
         if self.postproc is not None:
             self.postproc.to(self.passing_device)
         self.max_frames_per_traj = max_frames_per_traj
@@ -284,7 +286,6 @@ class SyncDataCollector(_DataCollector):
         self.exploration_mode = exploration_mode
         self.init_with_lag = init_with_lag and max_frames_per_traj > 0
 
-        self.passing_device = torch.device(passing_device)
 
         env.reset()
         self._tensordict = env.current_tensordict.to(self.passing_device)
