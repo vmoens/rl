@@ -88,6 +88,12 @@ class DDP(DDP0):
                     return [dict(i) for i in zip(*map(to_map, obj.items()))]
             return [obj]
 
+        # Avoid reference cycle
+        try:
+            res = to_map(inputs)
+        finally:
+            to_map = None
+        return res
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
