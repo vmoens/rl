@@ -39,6 +39,7 @@ def make_agent(
     replay_buffer: Optional[ReplayBuffer] = None,
     writer: Optional["SummaryWriter"] = None,
     args: Optional[Namespace] = None,
+    world_size: int = 1,
 ) -> Agent:
     """Creates an Agent instance given its constituents.
 
@@ -135,7 +136,7 @@ def make_agent(
         replay_buffer=replay_buffer,
         writer=writer,
         update_weights_interval=1,
-        frame_skip=args.frame_skip,
+        frame_skip=args.frame_skip * world_size,
         optim_steps_per_batch=args.optim_steps_per_collection,
         batch_size=args.batch_size,
         clip_grad_norm=args.clip_grad_norm,

@@ -53,6 +53,7 @@ def A2C(rank, world_size, args):
 
     device = torch.device(f"cuda:{rank}")
     args.collector_devices = [device]
+    args.total_frames = args.total_frames // world_size
 
     replay_buffer = None  # no RB for A2C
 
@@ -143,6 +144,7 @@ def A2C(rank, world_size, args):
         replay_buffer,
         writer,
         args,
+        world_size=world_size,
     )
 
     # run the agent
