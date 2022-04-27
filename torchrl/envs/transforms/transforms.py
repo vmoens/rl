@@ -1363,7 +1363,7 @@ class RandomEpsilonGreedy(Transform):
         tensordict.set(
             "_eps",
             torch.rand(
-                *tensordict.batch_size,
+                size=tensordict.batch_size,
                 device=tensordict.device,
             ) * (self.eps_max - self.eps_min) + self.eps_min,
         )
