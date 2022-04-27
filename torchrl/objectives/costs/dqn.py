@@ -171,7 +171,7 @@ class DistributionalDQNLoss(_LossModule):
         # from https://github.com/Kaixhin/Rainbow/blob/9ff5567ad1234ae0ed30d8471e8f13ae07119395/agent.py
         device = self.device
         tensordict = TensorDict(
-            source=input_tensordict, batch_size=input_tensordict.batch_size
+            source=input_tensordict.view(-1), batch_size=input_tensordict.batch_size
         ).to(device)
 
         if tensordict.batch_dims != 1:
