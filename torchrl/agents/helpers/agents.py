@@ -40,6 +40,7 @@ def make_agent(
     writer: Optional["SummaryWriter"] = None,
     args: Optional[Namespace] = None,
     world_size: int = 1,
+    **kwargs
 ) -> Agent:
     """Creates an Agent instance given its constituents.
 
@@ -146,6 +147,7 @@ def make_agent(
         normalize_rewards_online=args.normalize_rewards_online,
         sub_traj_len=args.sub_traj_len,
         selected_keys=args.selected_keys,
+        **kwargs
     )
 
 

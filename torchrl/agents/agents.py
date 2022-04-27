@@ -36,6 +36,7 @@ from torchrl.envs.utils import set_exploration_mode
 from torchrl.modules import reset_noise, TDModuleWrapper
 from torchrl.objectives.costs.common import _LossModule
 from torchrl.objectives.costs.utils import _TargetNetUpdate
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 REPLAY_BUFFER_CLASS = {
     "prioritized": TensorDictPrioritizedReplayBuffer,
@@ -392,7 +393,10 @@ class Agent:
         average_losses = None
 
         self.loss_module.apply(reset_noise)  # TODO: group in loss_module.reset?
-        self.loss_module.reset()
+        if isinstance(self.loss_module, DDP):
+            self.loss_module.module.reset()
+        else:
+            self.loss_module.reset()
 
         for j in range(self.optim_steps_per_batch):
             self._optim_count += 1

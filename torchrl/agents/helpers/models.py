@@ -1067,5 +1067,11 @@ def parser_model_args_discrete(parser: ArgumentParser) -> ArgumentParser:
         default=51,
         help="number of atoms used for the distributional loss",
     )
+    parser.add_argument(
+        "--no_eps_greedy",
+        action="store_false",
+        dest="eps_greedy",
+        help="whether not to use epsilon greedy exploration",
+    )
 
     return parser

@@ -1,5 +1,6 @@
 from torchrl.agents.helpers.collectors import \
     make_collector_offpolicy_singleprocess
+from torchrl.modules.td_module.exploration import StateLessEGreedyWrapper
 
 try:
     import configargparse as argparse
@@ -80,9 +81,12 @@ def A2C(rank, world_size, args):
     )
 
     # make the policy
-    model_explore = EGreedyWrapper(model, annealing_num_steps=args.annealing_frames).to(
-        device
-    )
+    if args.eps_greedy:
+        model_explore = StateLessEGreedyWrapper(
+            model,
+        ).to(device)
+    else:
+        model_explore = model
 
     # make the data collector (single process)
     stats = None
@@ -145,6 +149,7 @@ def A2C(rank, world_size, args):
         writer,
         args,
         world_size=world_size,
+        progress_bar=rank==0,
     )
 
     # run the agent

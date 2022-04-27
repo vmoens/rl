@@ -37,10 +37,10 @@ class EGreedyWrapper(TDModuleWrapper):
         >>> from torchrl.modules import EGreedyWrapper, Actor
         >>> from torchrl.data import NdBoundedTensorSpec, TensorDict
         >>> import torch
-        >>> torch.manual_seed(0)
+        >>> _ = torch.manual_seed(0)
         >>> spec = NdBoundedTensorSpec(-1, 1, torch.Size([4]))
         >>> module = torch.nn.Linear(4, 4, bias=False)
-        >>> policy = Actor(spec, module=module)
+        >>> policy = Actor(spec=spec, module=module)
         >>> explorative_policy = EGreedyWrapper(policy, eps_init=0.2)
         >>> td = TensorDict({"observation": torch.zeros(10, 4)}, batch_size=[10])
         >>> print(explorative_policy(td).get("action"))
@@ -93,6 +93,63 @@ class EGreedyWrapper(TDModuleWrapper):
         if exploration_mode() == "random" or exploration_mode() is None:
             out = tensordict.get(self.td_module.out_keys[0])
             eps = self.eps.item()
+            cond = (torch.rand(tensordict.shape, device=tensordict.device) < eps).to(
+                out.dtype
+            )
+            cond = expand_as_right(cond, out)
+            out = (
+                cond * self.td_module.spec.rand(tensordict.shape).to(out.device)
+                + (1 - cond) * out
+            )
+            tensordict.set(self.td_module.out_keys[0], out)
+        return tensordict
+
+class StateLessEGreedyWrapper(TDModuleWrapper):
+    """
+    Stateless Epsilon-Greedy PO wrapper.
+
+    Args:
+        policy (TDModule): a deterministic policy.
+
+    Examples:
+        >>> from torchrl.modules import EGreedyWrapper, Actor
+        >>> from torchrl.data import NdBoundedTensorSpec, TensorDict
+        >>> import torch
+        >>> _ = torch.manual_seed(0)
+        >>> spec = NdBoundedTensorSpec(-1, 1, torch.Size([4]))
+        >>> module = torch.nn.Linear(4, 4, bias=False)
+        >>> policy = Actor(spec=spec, module=module)
+        >>> explorative_policy = StateLessEGreedyWrapper(policy)
+        >>> td = TensorDict(
+        ...     {"observation": torch.zeros(10, 4),
+        ...      "_eps": torch.rand(10)}, batch_size=[10])
+        >>> print(explorative_policy(td).get("action"))
+        tensor([[ 0.0000,  0.0000,  0.0000,  0.0000],
+                [ 0.0526, -0.5127,  0.1692, -0.9337],
+                [ 0.0000,  0.0000,  0.0000,  0.0000],
+                [ 0.0000,  0.0000,  0.0000,  0.0000],
+                [ 0.3969,  0.1351,  0.6705, -0.5888],
+                [ 0.0000,  0.0000,  0.0000,  0.0000],
+                [ 0.4525,  0.4022, -0.5924,  0.3021],
+                [ 0.5490, -0.1262,  0.0382,  0.2317],
+                [ 0.6204,  0.9602, -0.7706, -0.3665],
+                [ 0.3930,  0.8285,  0.8702,  0.8824]], grad_fn=<AddBackward0>)
+
+    """
+
+    def __init__(
+        self,
+        policy: TDModule,
+        eps_key: int="_eps",
+    ):
+        super().__init__(policy)
+        self.eps_key = eps_key
+
+    def forward(self, tensordict: _TensorDict) -> _TensorDict:
+        tensordict = self.td_module.forward(tensordict)
+        if exploration_mode() == "random" or exploration_mode() is None:
+            out = tensordict.get(self.td_module.out_keys[0])
+            eps = tensordict.get(self.eps_key).squeeze(-1)
             cond = (torch.rand(tensordict.shape, device=tensordict.device) < eps).to(
                 out.dtype
             )
@@ -159,7 +216,7 @@ class OrnsteinUhlenbeckProcessWrapper(TDModuleWrapper):
         >>> torch.manual_seed(0)
         >>> spec = NdBoundedTensorSpec(-1, 1, torch.Size([4]))
         >>> module = torch.nn.Linear(4, 4, bias=False)
-        >>> policy = Actor(spec, module=module)
+        >>> policy = Actor(spec=spec, module=module)
         >>> explorative_policy = OrnsteinUhlenbeckProcessWrapper(policy)
         >>> td = TensorDict({"observation": torch.zeros(10, 4)}, batch_size=[10])
         >>> print(explorative_policy(td))

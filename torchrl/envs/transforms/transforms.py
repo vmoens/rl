@@ -55,6 +55,7 @@ __all__ = [
     "PinMemoryTransform",
     "VecNorm",
     "gSDENoise",
+    "RandomEpsilonGreedy",
 ]
 
 IMAGE_KEYS = ["next_observation", "next_pixels"]
@@ -161,7 +162,8 @@ class Transform(nn.Module):
         """
         return action_spec
 
-    def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
+    def transform_observation_spec(self,
+                                   observation_spec: TensorSpec) -> TensorSpec:
         """Transforms the observation spec such that the resulting spec
         matches transform mapping.
 
@@ -242,7 +244,8 @@ class TransformedEnv(_EnvClass):
     ):
         self.env = env
         self.transform = transform
-        transform.set_parent(self)  # allows to find env specs from the transform
+        transform.set_parent(
+            self)  # allows to find env specs from the transform
 
         self._last_obs = None
         self.cache_specs = cache_specs
@@ -311,7 +314,8 @@ class TransformedEnv(_EnvClass):
         return self.env.set_seed(seed)
 
     def _reset(self, tensordict: Optional[_TensorDict] = None, **kwargs):
-        out_tensordict = self.env.reset(execute_step=False, **kwargs).to(self.device)
+        out_tensordict = self.env.reset(execute_step=False, **kwargs).to(
+            self.device)
         out_tensordict = self.transform.reset(out_tensordict)
         out_tensordict = self.transform(out_tensordict)
         return out_tensordict
@@ -406,7 +410,8 @@ class Compose(Transform):
             action_spec = t.transform_action_spec(action_spec)
         return action_spec
 
-    def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
+    def transform_observation_spec(self,
+                                   observation_spec: TensorSpec) -> TensorSpec:
         for t in self.transforms:
             observation_spec = t.transform_observation_spec(observation_spec)
         return observation_spec
@@ -490,7 +495,8 @@ class ToTensorImage(ObservationTransform):
             observation = observation.unsqueeze(0)
         return observation
 
-    def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
+    def transform_observation_spec(self,
+                                   observation_spec: TensorSpec) -> TensorSpec:
         if isinstance(observation_spec, CompositeSpec):
             return CompositeSpec(
                 **{
@@ -641,7 +647,8 @@ class Resize(ObservationTransform):
 
         return observation
 
-    def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
+    def transform_observation_spec(self,
+                                   observation_spec: TensorSpec) -> TensorSpec:
         if isinstance(observation_spec, CompositeSpec):
             return CompositeSpec(
                 **{
@@ -691,7 +698,8 @@ class GrayScale(ObservationTransform):
         observation = F.rgb_to_grayscale(observation)
         return observation
 
-    def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
+    def transform_observation_spec(self,
+                                   observation_spec: TensorSpec) -> TensorSpec:
         if isinstance(observation_spec, CompositeSpec):
             return CompositeSpec(
                 **{
@@ -790,7 +798,8 @@ class ObservationNorm(ObservationTransform):
             loc = self.loc
         return obs * scale + loc
 
-    def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
+    def transform_observation_spec(self,
+                                   observation_spec: TensorSpec) -> TensorSpec:
         if isinstance(observation_spec, CompositeSpec):
             keys = [key for key in observation_spec.keys() if key in self.keys]
             for key in keys:
@@ -854,7 +863,8 @@ class CatFrames(ObservationTransform):
         self.buffer = []
         return tensordict
 
-    def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
+    def transform_observation_spec(self,
+                                   observation_spec: TensorSpec) -> TensorSpec:
         if isinstance(observation_spec, CompositeSpec):
             keys = [key for key in observation_spec.keys() if key in self.keys]
             for key in keys:
@@ -870,13 +880,14 @@ class CatFrames(ObservationTransform):
             space.maximum = torch.cat([space.maximum] * self.N, 0)
             _observation_spec.shape = space.minimum.shape
         else:
-            _observation_spec.shape = torch.Size([self.N, *_observation_spec.shape])
+            _observation_spec.shape = torch.Size(
+                [self.N, *_observation_spec.shape])
         observation_spec = _observation_spec
         return observation_spec
 
     def _apply(self, obs: torch.Tensor) -> torch.Tensor:
         self.buffer.append(obs)
-        self.buffer = self.buffer[-self.N :]
+        self.buffer = self.buffer[-self.N:]
         buffer = list(reversed(self.buffer))
         buffer = [buffer[0]] * (self.N - len(buffer)) + buffer
         if len(buffer) != self.N:
@@ -968,7 +979,8 @@ class FiniteTensorDictCheck(Transform):
                 else:
                     raise RuntimeError(str(err))
 
-        finite_tensordict = TensorDict(batch_size=tensordict.batch_size, source=source)
+        finite_tensordict = TensorDict(batch_size=tensordict.batch_size,
+                                       source=source)
         return finite_tensordict
 
 
@@ -1026,7 +1038,8 @@ class DoubleToFloat(Transform):
             self._transform_spec(reward_spec)
         return reward_spec
 
-    def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
+    def transform_observation_spec(self,
+                                   observation_spec: TensorSpec) -> TensorSpec:
         if isinstance(observation_spec, CompositeSpec):
             keys = [key for key in self.keys if key in observation_spec.keys()]
             for key in keys:
@@ -1113,12 +1126,14 @@ class CatTensors(Transform):
             )
         return tensordict
 
-    def transform_observation_spec(self, observation_spec: TensorSpec) -> TensorSpec:
+    def transform_observation_spec(self,
+                                   observation_spec: TensorSpec) -> TensorSpec:
         if not isinstance(observation_spec, CompositeSpec):
             # then there is a single tensor to be concatenated
             return observation_spec
 
-        keys = [key for key in observation_spec._specs.keys() if key in self.keys]
+        keys = [key for key in observation_spec._specs.keys() if
+                key in self.keys]
 
         sum_shape = sum(
             [
@@ -1245,7 +1260,8 @@ class NoopResetEnv(Transform):
         """Do no-op action for a number of steps in [1, noop_max]."""
         keys = tensordict.keys()
         noops = (
-            self.noops if not self.random else torch.randint(self.noops, (1,)).item()
+            self.noops if not self.random else torch.randint(self.noops,
+                                                             (1,)).item()
         )
         i = 0
         trial = 0
@@ -1325,6 +1341,31 @@ class gSDENoise(Transform):
                 state_dim,
                 device=tensordict.device,
             ),
+        )
+        return tensordict
+
+
+class RandomEpsilonGreedy(Transform):
+    inplace = False
+
+    def __init__(
+        self,
+        eps_max: float = 0.2,
+        eps_min: float = 0.01,
+    ) -> None:
+        super().__init__(keys=[])
+        self.eps_max = eps_max
+        self.eps_min = eps_min
+
+    def reset(self, tensordict: _TensorDict) -> _TensorDict:
+        tensordict = super().reset(tensordict=tensordict)
+
+        tensordict.set(
+            "_eps",
+            torch.rand(
+                *tensordict.batch_size,
+                device=tensordict.device,
+            ) * (self.eps_max - self.eps_min) + self.eps_min,
         )
         return tensordict
 
