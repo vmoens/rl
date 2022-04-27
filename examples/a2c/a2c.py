@@ -1,5 +1,11 @@
+import collections
+
+from torch.nn.parallel._functions import _get_stream
+from torch.nn.parallel.scatter_gather import is_namedtuple
+
 from torchrl.agents.helpers.collectors import \
     make_collector_offpolicy_singleprocess
+from torchrl.data.tensordict.tensordict import _TensorDict
 from torchrl.modules.td_module.exploration import StateLessEGreedyWrapper
 
 try:
@@ -22,7 +28,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.multiprocessing as mp
 
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.parallel import DistributedDataParallel as DDP0
 from torch.utils.tensorboard import SummaryWriter
 
 from torchrl.agents.helpers import transformed_env_constructor, make_dqn_actor, \
@@ -32,6 +38,55 @@ from torchrl.agents.helpers import transformed_env_constructor, make_dqn_actor, 
     parser_model_args_discrete, parser_recorder_args, parser_replay_args
 from torchrl.envs import TransformedEnv, RewardScaling
 from torchrl.modules import EGreedyWrapper
+
+class DDP(DDP0):
+    def _recursive_to(self, inputs, target_gpu):
+        r"""
+        Recursively moves input to the target_gpu.
+        """
+
+        def to_map(obj):
+            if isinstance(obj, (_TensorDict, torch.Tensor)):
+                if obj.device == torch.device("cuda", target_gpu):
+                    return (obj,)
+                if not self.use_side_stream_for_tensor_copies:
+                    return (obj.to(target_gpu),)
+                else:
+                    # Perform CPU -> GPU copies in a background stream. This code is
+                    # motivated from similar logic in torch/nn/parallel/_functions.py
+                    stream = _get_stream(target_gpu)
+                    with torch.cuda.stream(stream):
+                        output = obj.to(target_gpu)
+                    # synchronize with the copy stream
+                    with torch.cuda.device(target_gpu):
+                        current_stream = torch.cuda.current_stream()
+                        # Sync the current stream with the copy stream
+                        current_stream.wait_stream(stream)
+                        # Ensure tensor memory is not reused until work on
+                        # main stream is complete
+                        output.record_stream(current_stream)
+                    return (output,)
+            if is_namedtuple(obj):
+                return [type(obj)(*args) for args in zip(*map(to_map, obj))]
+            if isinstance(obj, tuple) and len(obj) > 0:
+                return list(zip(*map(to_map, obj)))
+            if isinstance(obj, str):
+                # Needs to be checked, otherwise it's taken as a sequence infinitely.
+                # This is because the elements of a string are also strings, and so on.
+                return [obj]
+            if isinstance(obj, collections.abc.Sequence) and len(obj) > 0:
+                try:
+                    return [type(obj)(i) for i in zip(*map(to_map, obj))]
+                except TypeError:
+                    # The sequence type may not support `__init__(iterable)` (e.g., `range`).
+                    return [list(i) for i in zip(*map(to_map, obj))]
+            if isinstance(obj, collections.abc.Mapping) and len(obj) > 0:
+                try:
+                    return [type(obj)(i) for i in zip(*map(to_map, obj.items()))]
+                except TypeError:
+                    # The mapping type may not support `__init__(iterable)`.
+                    return [dict(i) for i in zip(*map(to_map, obj.items()))]
+            return [obj]
 
 
 def setup(rank, world_size):
