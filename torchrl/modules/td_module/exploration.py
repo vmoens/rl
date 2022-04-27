@@ -145,6 +145,10 @@ class StateLessEGreedyWrapper(TDModuleWrapper):
         super().__init__(policy)
         self.eps_key = eps_key
 
+    @property
+    def in_keys(self):
+        return self.td_module.in_keys + [self.eps_key]
+
     def forward(self, tensordict: _TensorDict) -> _TensorDict:
         tensordict = self.td_module.forward(tensordict)
         if exploration_mode() == "random" or exploration_mode() is None:
