@@ -8,7 +8,7 @@ from typing import Callable
 import torch
 
 from torchrl.data import TensorDict
-from torchrl.data.tensordict.tensordict import _TensorDict
+from torchrl.data.tensordict.tensordict import TensorDictBase
 
 
 def _stack_output(fun) -> Callable:
@@ -27,7 +27,7 @@ def _stack_output_zip(fun) -> Callable:
     return stacked_output_fun
 
 
-def split_trajectories(rollout_tensordict: _TensorDict) -> _TensorDict:
+def split_trajectories(rollout_tensordict: TensorDictBase) -> TensorDictBase:
     """Takes a tensordict with a key traj_ids that indicates the id of each trajectory.
     From there, builds a B x T x ... zero-padded tensordict with B batches on max duration T
     """
@@ -35,11 +35,25 @@ def split_trajectories(rollout_tensordict: _TensorDict) -> _TensorDict:
     ndim = len(rollout_tensordict.batch_size)
     splits = traj_ids.view(-1)
     splits = [(splits == i).sum().item() for i in splits.unique_consecutive()]
+    # if all splits are identical then we can skip this function
+    if len(set(splits)) == 1 and splits[0] == traj_ids.shape[1]:
+        rollout_tensordict.set(
+            "mask",
+            torch.ones(
+                rollout_tensordict.shape,
+                device=rollout_tensordict.device,
+                dtype=torch.bool,
+            ),
+        )
+        if rollout_tensordict.ndimension() == 1:
+            rollout_tensordict = rollout_tensordict.unsqueeze(0).to_tensordict()
+        return rollout_tensordict
     out_splits = {
         key: _d.contiguous().view(-1, *_d.shape[ndim:]).split(splits, 0)
         for key, _d in rollout_tensordict.items()
         # if key not in ("step_count", "traj_ids")
     }
+
     # select complete rollouts
     dones = out_splits["done"]
     valid_ids = list(range(len(dones)))

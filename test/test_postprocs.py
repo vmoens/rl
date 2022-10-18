@@ -2,23 +2,26 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
+import argparse
 
 import pytest
 import torch
+from _utils_internal import get_available_devices
 from torchrl.collectors.utils import split_trajectories
 from torchrl.data.postprocs.postprocs import MultiStep
-from torchrl.data.tensordict.tensordict import TensorDict, assert_allclose_td
+from torchrl.data.tensordict.tensordict import assert_allclose_td, TensorDict
 
 
 @pytest.mark.parametrize("n", range(13))
+@pytest.mark.parametrize("device", get_available_devices())
 @pytest.mark.parametrize("key", ["observation", "pixels", "observation_whatever"])
-def test_multistep(n, key, T=11):
+def test_multistep(n, key, device, T=11):
     torch.manual_seed(0)
 
     # mock data
     b = 5
 
-    done = torch.zeros(b, T, 1, dtype=torch.bool)
+    done = torch.zeros(b, T, 1, dtype=torch.bool, device=device)
     done[0, -1] = True
     done[1, -2] = True
     done[2, -3] = True
@@ -30,22 +33,23 @@ def test_multistep(n, key, T=11):
     mask = done.clone().cumsum(1).cumsum(1) >= 2
     mask = ~mask
 
-    total_obs = torch.randn(1, T + 1, 1).expand(b, T + 1, 1)
+    total_obs = torch.randn(1, T + 1, 1, device=device).expand(b, T + 1, 1)
     tensordict = TensorDict(
         source={
             key: total_obs[:, :T] * mask.to(torch.float),
             "next_" + key: total_obs[:, 1:] * mask.to(torch.float),
             "done": done,
-            "reward": torch.randn(1, T, 1).expand(b, T, 1) * mask.to(torch.float),
+            "reward": torch.randn(1, T, 1, device=device).expand(b, T, 1)
+            * mask.to(torch.float),
             "mask": mask,
         },
         batch_size=(b, T),
-    )
+    ).to(device)
 
     ms = MultiStep(
         0.9,
         n,
-    )
+    ).to(device)
     ms_tensordict = ms(tensordict.clone())
 
     assert ms_tensordict.get("done").max() == 1
@@ -70,7 +74,7 @@ def test_multistep(n, key, T=11):
     assert ((next_obs == true_next_obs) | terminated[:, (1 + ms.n_steps_max) :]).all()
 
     # test gamma computation
-    torch.testing.assert_allclose(
+    torch.testing.assert_close(
         ms_tensordict.get("gamma"), ms.gamma ** ms_tensordict.get("steps_to_next_obs")
     )
 
@@ -96,7 +100,7 @@ class TestSplits:
         workers = torch.arange(num_workers)
 
         out = []
-        for i in range(traj_len):
+        for _ in range(traj_len):
             done = steps_count == traj_ids  # traj_id 0 has 0 steps, 1 has 1 step etc.
 
             td = TensorDict(
@@ -130,7 +134,7 @@ class TestSplits:
         assert split_trajs.shape[0] == split_trajs.get("traj_ids").max() + 1
         assert split_trajs.shape[1] == split_trajs.get("steps_count").max() + 1
 
-        split_trajs.get("mask").sum() == num_workers * traj_len
+        assert split_trajs.get("mask").sum() == num_workers * traj_len
 
         assert split_trajs.get("done").sum(1).max() == 1
         out_mask = split_trajs[split_trajs.get("mask")]
@@ -164,4 +168,5 @@ class TestSplits:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "--capture", "no"])
+    args, unknown = argparse.ArgumentParser().parse_known_args()
+    pytest.main([__file__, "--capture", "no", "--exitfirst"] + unknown)

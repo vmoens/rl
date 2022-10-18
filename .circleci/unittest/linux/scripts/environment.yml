@@ -3,13 +3,11 @@ channels:
   - defaults
 dependencies:
   - pip
-  - cmake >= 3.18
+  - protobuf
   - pip:
     - hypothesis
-    - protobuf
     - future
     - cloudpickle
-    - gym_retro
     - gym
     - pygame
     - gym[accept-rom-license]
@@ -19,8 +17,14 @@ dependencies:
     - pytest
     - pytest-cov
     - pytest-mock
+    - pytest-instafail
     - expecttest
     - pyyaml
     - scipy
+    - hydra-core
+    - tensorboard
+    - wandb
     - dm_control
-    - mujoco_py
+    - mlflow
+    - av
+    - coverage

@@ -4,3 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from .replay_buffers import *
+from .storages import *
+from . import rb_prototype
+from . import samplers
+from . import writers

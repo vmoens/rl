@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import typing
 from typing import Any, Callable, List, Sequence, Tuple, Union
 
 import numpy as np
@@ -25,37 +26,44 @@ numpy_to_torch_dtype_dict = {
 torch_to_numpy_dtype_dict = {
     value: key for key, value in numpy_to_torch_dtype_dict.items()
 }
-DEVICE_TYPING = Union[torch.device, str]  # , int]
+DEVICE_TYPING = Union[torch.device, str, int]
+if hasattr(typing, "get_args"):
+    DEVICE_TYPING_ARGS = typing.get_args(DEVICE_TYPING)
+else:
+    DEVICE_TYPING_ARGS = (torch.device, str, int)
 
-INDEX_TYPING = Union[None, int, slice, Tensor, List[Any], Tuple[Any, ...]]
+INDEX_TYPING = Union[None, int, slice, str, Tensor, List[Any], Tuple[Any, ...]]
 
 
 class CloudpickleWrapper(object):
-    def __init__(self, fn: Callable):
+    def __init__(self, fn: Callable, **kwargs):
         if fn.__class__.__name__ == "EnvCreator":
             raise RuntimeError(
                 "CloudpickleWrapper usage with EnvCreator class is "
                 "prohibited as it breaks the transmission of shared tensors."
             )
         self.fn = fn
+        self.kwargs = kwargs
 
     def __getstate__(self):
         import cloudpickle
 
-        return cloudpickle.dumps(self.fn)
+        return cloudpickle.dumps((self.fn, self.kwargs))
 
     def __setstate__(self, ob: bytes):
         import pickle
 
-        self.fn = pickle.loads(ob)
+        self.fn, self.kwargs = pickle.loads(ob)
 
     def __call__(self, **kwargs) -> Any:
+        kwargs = {k: item for k, item in kwargs.items()}
+        kwargs.update(self.kwargs)
         return self.fn(**kwargs)
 
 
 def expand_as_right(
-    tensor: Union[torch.Tensor, "MemmapTensor"],
-    dest: Union[torch.Tensor, "MemmapTensor"],
+    tensor: Union[torch.Tensor, "MemmapTensor", "TensorDictBase"],  # noqa: F821
+    dest: Union[torch.Tensor, "MemmapTensor", "TensorDictBase"],  # noqa: F821
 ):
     """Expand a tensor on the right to match another tensor shape.
     Args:
@@ -86,11 +94,11 @@ def expand_as_right(
         )
     for _ in range(dest.ndimension() - tensor.ndimension()):
         tensor = tensor.unsqueeze(-1)
-    return tensor.expand_as(dest)
+    return tensor.expand(dest.shape)
 
 
 def expand_right(
-    tensor: Union[torch.Tensor, "MemmapTensor"], shape: Sequence[int]
+    tensor: Union[torch.Tensor, "MemmapTensor"], shape: Sequence[int]  # noqa: F821
 ) -> torch.Tensor:
     """Expand a tensor on the right to match a desired shape.
     Args:
