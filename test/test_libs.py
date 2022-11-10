@@ -324,7 +324,6 @@ class TestHabitat:
 @pytest.mark.skipif(not _has_jumanji, reason="jumanji not installed")
 @pytest.mark.parametrize("envname", ["Snake-6x6-v0"])
 class TestJumanji:
-
     def test_jumanji_seeding(self, envname):
         final_seed = []
         tdreset = []
@@ -345,7 +344,7 @@ class TestJumanji:
 
     @pytest.mark.parametrize("batch_size", [(), (5,), (5, 4)])
     def test_jumanji_batch_size(self, envname, batch_size):
-        env = JumanjiEnv("Snake-6x6-v0", batch_size=batch_size)
+        env = JumanjiEnv(envname, batch_size=batch_size)
         tdreset = env.reset()
         tdrollout = env.rollout(max_steps=50)
         env.close()
@@ -365,10 +364,14 @@ class TestJumanji:
 
     @pytest.mark.parametrize("batch_size", [(), (5,), (5, 4)])
     def test_jumanji_spec_rollout(self, envname, batch_size):
-        env = JumanjiEnv("Snake-6x6-v0", batch_size=batch_size)
+        env = JumanjiEnv(envname, batch_size=batch_size)
         tdrollout = env.rollout(max_steps=50)
-        fake_td = env.fake_tensordict().unsqueeze(-1).expand(*tdrollout.shape).contiguous()
+        fake_td = (
+            env.fake_tensordict().unsqueeze(-1).expand(*tdrollout.shape).contiguous()
+        )
+        tdrollout.zero_()
         assert (tdrollout == fake_td).all()
+
 
 if __name__ == "__main__":
     args, unknown = argparse.ArgumentParser().parse_known_args()
