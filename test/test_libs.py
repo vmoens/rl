@@ -363,6 +363,12 @@ class TestJumanji:
         assert tdrollout["reward"].shape == rollout_batch_size + (1,)
         assert tdrollout["done"].shape == rollout_batch_size + (1,)
 
+    @pytest.mark.parametrize("batch_size", [(), (5,), (5, 4)])
+    def test_jumanji_spec_rollout(self, envname, batch_size):
+        env = JumanjiEnv("Snake-6x6-v0", batch_size=batch_size)
+        tdrollout = env.rollout(max_steps=50)
+        fake_td = env.fake_tensordict().unsqueeze(-1).expand(*tdrollout.shape).contiguous()
+        assert (tdrollout == fake_td).all()
 
 if __name__ == "__main__":
     args, unknown = argparse.ArgumentParser().parse_known_args()
