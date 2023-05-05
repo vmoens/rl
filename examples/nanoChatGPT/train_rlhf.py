@@ -79,9 +79,6 @@ def main():
     for i in range(max_iters):
         with torch.no_grad():
             td = env.rollout(ep_length, policy=actor, return_contiguous=True)
-        print(
-            f"Iteration {i}: {loss_val=}, reward={td.get(('next', 'reward')).mean(): 4.4f}"
-        )
         for epoch in range(num_epochs):
             adv_fn(td)
             rb.extend(td.view(-1))
@@ -99,6 +96,9 @@ def main():
                 optimizer.zero_grad()
 
                 # Logging
+        print(
+            f"Iteration {i}: {loss_val=}, reward={td.get(('next', 'reward')).mean(): 4.4f}"
+        )
 
     # TODO: save model
     # TODO: generate something?
