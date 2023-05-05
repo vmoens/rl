@@ -78,10 +78,11 @@ def main():
 
     for i in range(max_iters):
         with torch.no_grad():
-            td = env.rollout(ep_length, policy=actor, return_contiguous=True)
+            td = env.rollout(ep_length, policy=actor, return_contiguous=True).cpu()
         for epoch in range(num_epochs):
-            adv_fn(td)
+            tdd = adv_fn(td.to(device))
             rb.extend(td.view(-1))
+            del tdd
             for batch in rb:
 
                 # TODO: add replay buffer?
