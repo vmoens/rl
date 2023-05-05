@@ -95,8 +95,6 @@ def main():
                 loss_val.backward()
                 optimizer.step()
                 optimizer.zero_grad()
-
-                # Logging
         print(
             f"Iteration {i}: {loss_val=}, reward={td.get(('next', 'reward')).mean(): 4.4f}"
         )

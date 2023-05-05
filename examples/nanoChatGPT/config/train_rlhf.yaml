@@ -37,5 +37,5 @@ dtype: bfloat16 # 'float32', 'bfloat16', or 'float16', the latter will auto impl
 compile: True # use PyTorch 2.0 to compile the model to be faster
 # verbose
 verbose: False
-ppo_batch_size: 32
+ppo_batch_size: 2
 num_epochs: 10
