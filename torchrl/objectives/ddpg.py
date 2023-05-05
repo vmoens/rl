@@ -14,8 +14,6 @@ import torch
 from tensordict.nn import make_functional, repopulate_module, TensorDictModule
 from tensordict.tensordict import TensorDict, TensorDictBase
 
-from torchrl.envs.utils import ExplorationType, set_exploration_type
-
 from torchrl.modules.tensordict_module.actors import ActorCriticWrapper
 from torchrl.objectives.common import LossModule
 from torchrl.objectives.utils import (
@@ -82,7 +80,7 @@ class DDPGLoss(LossModule):
         self.loss_funtion = loss_function
 
         if gamma is not None:
-            warnings.warn(_GAMMA_LMBDA_DEPREC_WARNING)
+            warnings.warn(_GAMMA_LMBDA_DEPREC_WARNING, category=DeprecationWarning)
             self.gamma = gamma
 
     def forward(self, input_tensordict: TensorDictBase) -> TensorDict:
@@ -162,10 +160,9 @@ class DDPGLoss(LossModule):
             batch_size=self.target_actor_network_params.batch_size,
             device=self.target_actor_network_params.device,
         )
-        with set_exploration_type(ExplorationType.MODE):
-            target_value = self.value_estimator.value_estimate(
-                tensordict, target_params=target_params
-            ).squeeze(-1)
+        target_value = self.value_estimator.value_estimate(
+            tensordict, target_params=target_params
+        ).squeeze(-1)
 
         # td_error = pred_val - target_value
         loss_value = distance_loss(
@@ -174,7 +171,10 @@ class DDPGLoss(LossModule):
 
         return loss_value, (pred_val - target_value).pow(2), pred_val, target_value
 
-    def make_value_estimator(self, value_type: ValueEstimators, **hyperparams):
+    def make_value_estimator(self, value_type: ValueEstimators = None, **hyperparams):
+        if value_type is None:
+            value_type = self.default_value_estimator
+        self.value_type = value_type
         hp = dict(default_value_kwargs(value_type))
         if hasattr(self, "gamma"):
             hp["gamma"] = self.gamma

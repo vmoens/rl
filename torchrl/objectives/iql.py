@@ -10,8 +10,6 @@ from tensordict.nn import TensorDictModule
 from tensordict.tensordict import TensorDict, TensorDictBase
 from torch import Tensor
 
-from torchrl.envs.utils import ExplorationType, set_exploration_type
-
 from torchrl.modules import ProbabilisticActor
 from torchrl.objectives.common import LossModule
 from torchrl.objectives.utils import (
@@ -23,7 +21,10 @@ from torchrl.objectives.utils import (
 from torchrl.objectives.value import TD0Estimator, TD1Estimator, TDLambdaEstimator
 
 try:
-    from functorch import vmap
+    try:
+        from torch import vmap
+    except ImportError:
+        from functorch import vmap
 
     _has_functorch = True
     err = ""
@@ -112,7 +113,7 @@ class IQLLoss(LossModule):
         self.priority_key = priority_key
         self.loss_function = loss_function
         if gamma is not None:
-            warnings.warn(_GAMMA_LMBDA_DEPREC_WARNING)
+            warnings.warn(_GAMMA_LMBDA_DEPREC_WARNING, category=DeprecationWarning)
             self.gamma = gamma
 
     @property
@@ -167,11 +168,10 @@ class IQLLoss(LossModule):
 
     def _loss_actor(self, tensordict: TensorDictBase) -> Tensor:
         # KL loss
-        with set_exploration_type(ExplorationType.MODE):
-            dist = self.actor_network.get_dist(
-                tensordict,
-                params=self.actor_network_params,
-            )
+        dist = self.actor_network.get_dist(
+            tensordict,
+            params=self.actor_network_params,
+        )
 
         log_prob = dist.log_prob(tensordict["action"])
 
@@ -243,7 +243,10 @@ class IQLLoss(LossModule):
         )
         return loss_qval, td_error.detach().max(0)[0]
 
-    def make_value_estimator(self, value_type: ValueEstimators, **hyperparams):
+    def make_value_estimator(self, value_type: ValueEstimators = None, **hyperparams):
+        if value_type is None:
+            value_type = self.default_value_estimator
+        self.value_type = value_type
         value_net = self.value_network
 
         value_key = "state_value"
