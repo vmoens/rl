@@ -38,3 +38,4 @@ compile: True # use PyTorch 2.0 to compile the model to be faster
 # verbose
 verbose: False
 ppo_batch_size: 32
+num_epochs: 10
