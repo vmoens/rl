@@ -81,7 +81,7 @@ def main():
             td = env.rollout(ep_length, policy=actor, return_contiguous=True).cpu()
         for epoch in range(num_epochs):
             tdd = adv_fn(td.to(device))
-            rb.extend(td.view(-1))
+            rb.extend(tdd.view(-1))
             del tdd
             for batch in rb:
 
