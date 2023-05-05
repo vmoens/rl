@@ -69,6 +69,7 @@ def main():
     ep_length = config["episode_length"]
     max_iters = config["max_iters"]
     num_epochs = config["num_epochs"]
+    device = config['device']
     rb = TensorDictReplayBuffer(
         storage=LazyTensorStorage(ep_length * config["batch_size"]),
         batch_size=config["ppo_batch_size"],
@@ -86,7 +87,7 @@ def main():
 
                 # TODO: add replay buffer?
                 # with set_skip_existing(True):
-                loss_vals = loss_fn(batch)
+                loss_vals = loss_fn(batch.to(device))
 
                 loss_val = sum(
                     value for key, value in loss_vals.items() if key.startswith("loss")
