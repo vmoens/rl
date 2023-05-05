@@ -68,6 +68,7 @@ def main():
 
     ep_length = config["episode_length"]
     max_iters = config["max_iters"]
+    num_epochs = config["num_epochs"]
     rb = TensorDictReplayBuffer(
         storage=LazyTensorStorage(ep_length * config["batch_size"]),
         batch_size=config["ppo_batch_size"],
@@ -78,7 +79,7 @@ def main():
         with torch.no_grad():
             td = env.rollout(ep_length, policy=actor, return_contiguous=True)
 
-        for epoch in config["num_epochs"]:
+        for epoch in range(num_epochs):
             adv_fn(td)
             rb.extend(td.view(-1))
             for batch in rb:
