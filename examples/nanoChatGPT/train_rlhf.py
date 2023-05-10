@@ -1,4 +1,3 @@
-import time
 from pathlib import Path
 
 import torch
@@ -10,12 +9,13 @@ from models.reward import init_reward_model
 from shared import setup
 from tensordict.nn import set_skip_existing, TensorDictModuleBase
 from torch import vmap
-
+from torchrl.collectors import SyncDataCollector
 from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
 from torchrl.data.replay_buffers import SamplerWithoutReplacement
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from utils import load_and_update_config
+import tqdm
 
 HERE = Path(__file__).parent
 
@@ -57,7 +57,11 @@ def main():
     loss_fn = ClipPPOLoss(actor, critic_head)
 
     # Optimizer
-    optimizer = torch.optim.AdamW(loss_fn.parameters(), lr=1e-3)
+    lr = config["learning_rate"]
+    wd = config["weight_decay"]
+    beta1 = config["beta1"]
+    beta2 = config["beta2"]
+    optimizer = torch.optim.AdamW(loss_fn.parameters(), lr=lr, weight_decay=wd, betas=(beta1, beta2))
 
     # DataLoader
     train_loader, _ = get_dataloaders(config)
@@ -71,41 +75,62 @@ def main():
     max_iters = config["max_iters"]
     num_epochs = config["num_epochs"]
     device = config['device']
+    num_envs = config["batch_size"]
+    grad_clip = config["grad_clip"]
+
+    total_frames = max_iters * num_envs * ep_length
     rb = TensorDictReplayBuffer(
-        storage=LazyTensorStorage(ep_length * config["batch_size"]),
+        storage=LazyTensorStorage(ep_length * num_envs),
         batch_size=config["ppo_batch_size"],
         sampler=SamplerWithoutReplacement(),
     )
     rewards = []
     losses = []
+    
+    # a quick rollout to init the actor
+    with torch.no_grad():
+        td = env.rollout(3, actor)
+    del td
 
-
-    for i in range(max_iters):
-        start_time = time.time()
-        with torch.no_grad():
-            td = env.rollout(ep_length, policy=actor, return_contiguous=True).cpu()
+    collector = SyncDataCollector(
+        env,
+        actor.eval(),
+        frames_per_batch=ep_length*num_envs,
+        total_frames = total_frames,
+        device=device,
+        storing_device="cpu",
+    )
+    pbar = tqdm.tqdm(total=total_frames)
+    for i, td in enumerate(collector):
+        rewards.append(td.get(("next", "reward")).mean().cpu())
+        pbar.update(td.numel())
+        loss_fn.train()
         for epoch in range(num_epochs):
-            tdd = adv_fn(td.to(device)).exclude("x")
-            # print(tdd)
+            with torch.no_grad():
+                tdd = td.update(adv_fn(td.select(*adv_fn.in_keys).to(device)).cpu())
             rb.extend(tdd.reshape(-1))
-            del tdd
-            for batch in rb:
+            if len(rb) != tdd.numel():
+                raise ValueError("The replay buffer size and the td content must match "
+                                 f"exactly, got {len(rb)} and {tdd.numel()} respectively")
+            for j, batch in enumerate(rb):
                 # with set_skip_existing(True):
                 loss_vals = loss_fn(batch.to(device))
-
+            
                 loss_val = sum(
                     value for key, value in loss_vals.items() if key.startswith("loss")
                 )
                 loss_val.backward()
+                losses.append(loss_val.detach().cpu())
+                gn = torch.nn.utils.clip_grad_norm_(loss_fn.parameters(), grad_clip)
                 optimizer.step()
                 optimizer.zero_grad()
-        print(
-            f"Iteration {i}: {loss_val=}, "
-            f"reward={td.get(('next', 'reward')).mean(): 4.4f}, "
-            f"time elapsed={time.time() - start_time:.2f}"
-        )
-        rewards.append(-td.get(("next", "reward")).mean().detach().cpu())
-        losses.append(loss_val.detach().cpu())
+                pbar.set_description(
+                    f"Iteration {i}: loss_val={loss_val: 4.4f}, "
+                    f"epoch and sub-steps={(epoch, j+1)}, "
+                    f"reward={td.get(('next', 'reward')).mean(): 4.4f} (init: {rewards[0]: 4.4f}), "
+                    f"grad norm: {gn: 4.4f}"
+                )
+        actor.eval()
 
     import matplotlib.pyplot as plt
 
