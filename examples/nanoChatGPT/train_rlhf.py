@@ -16,9 +16,23 @@ from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
 from utils import load_and_update_config
 import tqdm
+import csv
 
 HERE = Path(__file__).parent
 
+def append_to_csv(number, filename):
+    # Create the file if it doesn't exist
+    try:
+        with open(filename, 'x', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Number'])
+    except FileExistsError:
+        pass
+
+    # Append the number to the CSV file
+    with open(filename, 'a', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow([number])
 
 def main():
     config = load_and_update_config("config/train_rlhf.yaml")
@@ -102,7 +116,10 @@ def main():
     )
     pbar = tqdm.tqdm(total=total_frames)
     for i, td in enumerate(collector):
-        rewards.append(td.get(("next", "reward")).mean().cpu())
+        rewards.append(td.get(("next", "reward")).mean().cpu().item())
+        # this is an ugly way of following training on the cluster
+        append_to_csv(rewards[-1], "rewards.csv")
+
         pbar.update(td.numel())
         loss_fn.train()
         for epoch in range(num_epochs):
@@ -132,6 +149,21 @@ def main():
                 )
         actor.eval()
         collector.update_policy_weights_()
+
+        print(
+            env.enc.decode(
+                td.get(('next', 'prompt'))[-1, 0].tolist()
+            ),
+            td.get(('next', 'reward'))[-1, 0],
+            sep="\n",
+            end="\n\n",
+        )
+        print(
+            env.enc.decode(td.get(('next', 'prompt'))[-1, -1].tolist()),
+            td.get(('next', 'reward'))[-1, -1],
+            sep="\n",
+            end="\n\n",
+        )
 
     import matplotlib.pyplot as plt
 
