@@ -97,7 +97,7 @@ def main():
         actor.eval(),
         frames_per_batch=ep_length*num_envs,
         total_frames = total_frames,
-        device=device,
+        device="cuda:1",
         storing_device="cpu",
     )
     pbar = tqdm.tqdm(total=total_frames)
@@ -131,6 +131,7 @@ def main():
                     f"grad norm: {gn: 4.4f}"
                 )
         actor.eval()
+        collector.update_policy_weights_()
 
     import matplotlib.pyplot as plt
 
