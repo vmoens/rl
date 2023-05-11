@@ -109,6 +109,7 @@ def main():
         sampler=SamplerWithoutReplacement(),
     )
     rewards = []
+    test_rewards = []
     losses = []
     
     # a quick rollout to init the actor
@@ -128,22 +129,21 @@ def main():
         with set_exploration_type(ExplorationType.MODE), torch.no_grad():
             td = test_env.rollout(50, actor)
         actor.train(training)
-        print(
-            "First query",
-            enc.decode(
-                td.get(('next', 'prompt'))[-1, 0].tolist()
-            ),
-            td.get(('next', 'reward'))[-1, 0],
-            sep="\n",
-            end="\n\n",
-        )
-        print(
-            "Last query",
-            enc.decode(td.get(('next', 'prompt'))[-1, -1].tolist()),
-            td.get(('next', 'reward'))[-1, -1],
-            sep="\n",
-            end="\n\n",
-        )
+        string_to_write = f"""First query:
+{enc.decode(td.get(('next', 'prompt'))[-1, 0].tolist())},
+reward={td.get(('next', 'reward'))[-1, 0].item(): 4.4f}
+
+
+================================================================================
+
+
+Last query:
+{enc.decode(td.get(('next', 'prompt'))[-1, -1].tolist())},
+reward={td.get(('next', 'reward'))[-1, -1].item(): 4.4f}
+"""
+        with open("queries.txt", 'w') as file:
+            file.write(string_to_write)
+        return td.get(('next', 'reward'))[-1, -1].item()
 
     collector = SyncDataCollector(
         env,
@@ -160,7 +160,8 @@ def main():
         append_to_csv(rewards[-1], "rewards.csv")
 
         if i % 10 == 0:
-            test()
+            test_rewards.append(test())
+            append_to_csv(test_rewards[-1], "test_rewards.csv")
 
         pbar.update(td.numel())
         loss_fn.train()
@@ -172,7 +173,6 @@ def main():
                 raise ValueError("The replay buffer size and the td content must match "
                                  f"exactly, got {len(rb)} and {tdd.numel()} respectively")
             for j, batch in enumerate(rb):
-                # with set_skip_existing(True):
                 loss_vals = loss_fn(batch.to(device))
             
                 loss_val = sum(

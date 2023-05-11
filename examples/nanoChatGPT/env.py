@@ -22,22 +22,23 @@ def _step(self, tensordict):
     prompt = tensordict.get("prompt")
 
     # perform the action
-    action = tensordict.get("action").squeeze(-1)
+    action = tensordict.get("action")
+
+    # The output must be written in a ``"next"`` entry
+    next_prompt = torch.hstack((prompt, action))[
+        :, -self.block_size :
+    ]
 
     # compute the reward
     if self.step_num >= self.episode_length:
-        reward = self.reward_model(prompt)
+        reward = self.reward_model(next_prompt)
         done = torch.ones_like(reward, dtype=torch.bool)
     else:
         reward = torch.zeros((*tensordict.batch_size, 1))
         done = torch.zeros_like(reward, dtype=torch.bool)
     assert self.reward_spec.shape == reward.shape, (self.batch_size, reward.shape, reward.dtype)
     assert self.done_spec.shape == done.shape, (self.batch_size, done.shape, done.dtype)
-    
-    # The output must be written in a ``"next"`` entry
-    next_prompt = torch.hstack((prompt, action[..., None]))[
-        :, -self.block_size :
-    ]
+
     out = TensorDict(
         {"next": {"prompt": next_prompt, "reward": reward, "done": done}},
         tensordict.shape,

@@ -1,7 +1,7 @@
 import copy
 
 import torch.nn as nn
-from tensordict.nn import TensorDictModule, TensorDictSequential
+from tensordict.nn import TensorDictModule, TensorDictSequential, TensorDictModuleBase
 from torch.distributions.categorical import Categorical
 
 from torchrl.modules import (
@@ -14,6 +14,16 @@ from .transformer import init_transformer
 
 __all__ = ["ActorCritic", "init_actor_critic"]
 
+class PrintModule(TensorDictModuleBase):
+    def __init__(self, prefix=""):
+        super().__init__()
+        self.in_keys=[]
+        self.out_keys=[]
+        self.prefix = prefix
+    def forward(self, td):
+        print(self.prefix, td)
+        return td
+        
 
 class ActorCritic(ActorValueOperator):
     def __init__(self, base_model):
@@ -31,7 +41,7 @@ class ActorCritic(ActorValueOperator):
         value_head = nn.Linear(n_embd, 1, bias=False)
 
         common = TensorDictModule(base_model, in_keys=["prompt"], out_keys=["x"])
-
+        
         actor_head = TensorDictModule(actor_head, in_keys=["x"], out_keys=["logits"])
         actor_head = SafeProbabilisticTensorDictSequential(
             actor_head,
