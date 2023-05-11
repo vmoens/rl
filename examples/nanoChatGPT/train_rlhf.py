@@ -14,9 +14,12 @@ from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
 from torchrl.data.replay_buffers import SamplerWithoutReplacement
 from torchrl.objectives import ClipPPOLoss
 from torchrl.objectives.value import GAE
+from torchrl.envs import set_exploration_type, ExplorationType
 from utils import load_and_update_config
 import tqdm
 import csv
+import tiktoken
+from copy import deepcopy
 
 HERE = Path(__file__).parent
 
@@ -34,14 +37,21 @@ def append_to_csv(number, filename):
         writer = csv.writer(file)
         writer.writerow([number])
 
+
 def main():
+    enc = tiktoken.get_encoding("gpt2")
+
     config = load_and_update_config("config/train_rlhf.yaml")
     setup(config)
 
     # ######## INIT MODELS ########
     actor, critic, critic_head = init_actor_critic(config)
-
+    actor.eval()  # deactivate dropout on all modules
+    critic.eval()
+    
     reward_model, _ = init_reward_model(config)
+    reward_model.requires_grad_(False)
+    reward_model.eval()
 
     # ######## INIT TRAINING FUNCTIONS ########
     # Advantage
@@ -106,12 +116,41 @@ def main():
         td = env.rollout(3, actor)
     del td
 
+    test_config = deepcopy(config)
+    test_config["batch_size"] = 1
+    test_config["episode_length"] = 50
+    train_loader_test, _ = get_dataloaders(test_config)
+    test_env = RLHFEnv(reward_model=reward_model, config=test_config, dataloader=train_loader_test)
+
+    def test():
+        training = actor.training
+        actor.eval()
+        with set_exploration_type(ExplorationType.MODE), torch.no_grad():
+            td = test_env.rollout(50, actor)
+        actor.train(training)
+        print(
+            "First query",
+            enc.decode(
+                td.get(('next', 'prompt'))[-1, 0].tolist()
+            ),
+            td.get(('next', 'reward'))[-1, 0],
+            sep="\n",
+            end="\n\n",
+        )
+        print(
+            "Last query",
+            enc.decode(td.get(('next', 'prompt'))[-1, -1].tolist()),
+            td.get(('next', 'reward'))[-1, -1],
+            sep="\n",
+            end="\n\n",
+        )
+
     collector = SyncDataCollector(
         env,
         actor.eval(),
         frames_per_batch=ep_length*num_envs,
         total_frames = total_frames,
-        device="cuda:1",
+        device=device,
         storing_device="cpu",
     )
     pbar = tqdm.tqdm(total=total_frames)
@@ -119,6 +158,9 @@ def main():
         rewards.append(td.get(("next", "reward")).mean().cpu().item())
         # this is an ugly way of following training on the cluster
         append_to_csv(rewards[-1], "rewards.csv")
+
+        if i % 10 == 0:
+            test()
 
         pbar.update(td.numel())
         loss_fn.train()
@@ -149,21 +191,6 @@ def main():
                 )
         actor.eval()
         collector.update_policy_weights_()
-
-        print(
-            env.enc.decode(
-                td.get(('next', 'prompt'))[-1, 0].tolist()
-            ),
-            td.get(('next', 'reward'))[-1, 0],
-            sep="\n",
-            end="\n\n",
-        )
-        print(
-            env.enc.decode(td.get(('next', 'prompt'))[-1, -1].tolist()),
-            td.get(('next', 'reward'))[-1, -1],
-            sep="\n",
-            end="\n\n",
-        )
 
     import matplotlib.pyplot as plt
 
