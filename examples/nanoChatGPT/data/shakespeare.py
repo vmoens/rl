@@ -18,9 +18,6 @@ class Collate(nn.Module):
         self.device = torch.device(device)
 
     def __call__(self, batch):
-        print(batch)
-        # batch = torch.stack(batch, dim=0).contiguous()
-        # batch.batch_size = []
         if self.device.type == "cuda":
             batch = batch.pin_memory()
         return batch.to(self.device)
