@@ -88,7 +88,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
 
     collector = collector_cls(
         create_env_fn=create_env_fn,
-        policy=model_explore,
+        policy=model_explore.to(collector_device),
         frames_per_batch=frames_per_batch,
         total_frames=total_frames,
         device=collector_device,
@@ -160,7 +160,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
         collected_frames += current_frames
         greedy_module.step(current_frames)
         replay_buffer.extend(data)
-        train = train or (collected_frames >= init_random_frames * frame_skip)
+        train = train or (collected_frames >= (init_random_frames * frame_skip))
 
         # Get and log training rewards and episode lengths
         episode_rewards = data["next", "episode_reward"][data["next", "done"]]
