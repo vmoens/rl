@@ -558,7 +558,7 @@ class SyncDataCollector(DataCollectorBase):
         )
 
         if isinstance(self.policy, nn.Module):
-            self.policy_weights = TensorDict.from_module(self.policy.named_parameters(), as_module=True)
+            self.policy_weights = TensorDict.from_module(self.policy, as_module=True)
         else:
             self.policy_weights = TensorDict({}, [])
 
