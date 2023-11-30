@@ -30,7 +30,7 @@ from torchrl.modules import ConvNet, MLP, QValueActor
 # --------------------------------------------------------------------
 
 
-def make_env(env_name, frame_skip, device, is_test=False):
+def make_env(env_name, frame_skip, device, is_test=False, transform=True):
     env = GymEnv(
         env_name,
         frame_skip=frame_skip,
@@ -38,6 +38,12 @@ def make_env(env_name, frame_skip, device, is_test=False):
         pixels_only=False,
         device=device,
     )
+    if transform:
+        return transform_env(env, is_test=is_test)
+    return env
+
+
+def transform_env(env, is_test):
     env = TransformedEnv(env)
     env.append_transform(NoopResetEnv(noops=30, random=True))
     if not is_test:

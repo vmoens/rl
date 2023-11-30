@@ -24,7 +24,7 @@ from torchrl.envs import EnvCreator, ExplorationType, ParallelEnv, set_explorati
 from torchrl.modules import EGreedyModule
 from torchrl.objectives import DQNLoss, HardUpdate
 from torchrl.record.loggers import generate_exp_name, get_logger
-from utils_atari import eval_model, make_dqn_model, make_env
+from utils_atari import eval_model, make_dqn_model, make_env, transform_env
 
 
 @hydra.main(config_path=".", config_name="config_atari", version_base="1.1")
@@ -64,14 +64,20 @@ def main(cfg: "DictConfig"):  # noqa: F821
             )
         )
     else:
-        create_env_fn = ParallelEnv(
-            cfg.collector.env_per_collectors,
-            EnvCreator(
-                lambda cfg=cfg, frame_skip=frame_skip: make_env(
-                    cfg.env.env_name, frame_skip, "cpu"
-                )
+        create_env_fn = transform_env(
+            ParallelEnv(
+                cfg.collector.env_per_collectors,
+                EnvCreator(
+                    lambda cfg=cfg, frame_skip=frame_skip: make_env(
+                        cfg.env.env_name,
+                        frame_skip,
+                        "cpu",
+                        transform=False,
+                    )
+                ),
+                device=collector_device,
             ),
-            device=collector_device,
+            is_test=False,
         )
 
     if cfg.collector.num_collectors <= 1:
