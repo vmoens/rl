@@ -232,7 +232,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
         # Log all the information
         if logger:
             for key, value in log_info.items():
-                logger.log_scalar(key, value, step=collected_frames)
+                logger.log_scalar(key, value, step=i)
             logger.log_scalar("collected_frames", collected_frames, step=i)
 
         # update weights of the inference policy
