@@ -18,7 +18,7 @@ import torch.optim
 import tqdm
 from tensordict.nn import TensorDictSequential
 
-from torchrl.collectors import MultiaSyncDataCollector
+from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector
 from torchrl.data import LazyMemmapStorage, TensorDictReplayBuffer
 from torchrl.envs import ExplorationType, set_exploration_type, EnvCreator, ParallelEnv
 from torchrl.modules import EGreedyModule
@@ -53,8 +53,19 @@ def main(cfg: "DictConfig"):  # noqa: F821
     ).to(device)
 
     # Create the collector
-    collector = MultiaSyncDataCollector(
-        create_env_fn=[ParallelEnv(4, EnvCreator(lambda cfg=cfg, frame_skip=frame_skip: make_env(cfg.env.env_name, frame_skip, "cpu")), device=device)] * 4,
+    if cfg.collector.env_per_collectors <= 1:
+        create_env_fn=EnvCreator(lambda cfg=cfg, frame_skip=frame_skip: make_env(cfg.env.env_name, frame_skip, device=device))
+    else:
+        create_env_fn=ParallelEnv(cfg.collector.env_per_collectors, EnvCreator(lambda cfg=cfg, frame_skip=frame_skip: make_env(cfg.env.env_name, frame_skip, "cpu")), device=device)
+
+    if cfg.collector.num_collectors <= 1:
+        collector_cls = SyncDataCollector
+    else:
+        collector_cls = MultiaSyncDataCollector
+        create_env_fn = [create_env_fn] * cfg.collector.num_collectors
+
+    collector = collector_cls(
+        create_env_fn=create_env_fn,
         policy=model_explore,
         frames_per_batch=frames_per_batch,
         total_frames=total_frames,
