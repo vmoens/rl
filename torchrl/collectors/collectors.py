@@ -1196,9 +1196,7 @@ class _MultiDataCollector(DataCollectorBase):
             )
             self._policy_dict[_device] = _policy
             if isinstance(_policy, nn.Module):
-                param_dict = dict(_policy.named_parameters())
-                param_dict.update(_policy.named_buffers())
-                self._policy_weights_dict[_device] = TensorDict(param_dict, [])
+                self._policy_weights_dict[_device] = TensorDict.from_module(_policy, as_module=True)
             else:
                 self._policy_weights_dict[_device] = TensorDict({}, [])
 
@@ -1284,11 +1282,11 @@ class _MultiDataCollector(DataCollectorBase):
     def update_policy_weights_(self, policy_weights=None) -> None:
         for _device in self._policy_dict:
             if policy_weights is not None:
-                self._policy_weights_dict[_device].apply(lambda x: x.data).update_(
+                self._policy_weights_dict[_device].data.update_(
                     policy_weights
                 )
             elif self._get_weights_fn_dict[_device] is not None:
-                self._policy_weights_dict[_device].update_(
+                self._policy_weights_dict[_device].data.update_(
                     self._get_weights_fn_dict[_device]()
                 )
 
