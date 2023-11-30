@@ -92,7 +92,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
 
     collector = collector_cls(
         create_env_fn=create_env_fn,
-        policy=deepcopy(model_explore).to(collector_device),
+        policy=model_explore,
         frames_per_batch=frames_per_batch,
         total_frames=total_frames,
         device=collector_device,
