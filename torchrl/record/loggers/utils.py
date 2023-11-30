@@ -50,7 +50,7 @@ def get_logger(
 
         wandb_kwargs = kwargs.get("wandb_kwargs", {})
         logger = WandbLogger(
-            log_dir=logger_name, exp_name=experiment_name, **wandb_kwargs
+            project=logger_name, exp_name=experiment_name, **wandb_kwargs
         )
     elif logger_type == "mlflow":
         from torchrl.record.loggers.mlflow import MLFlowLogger

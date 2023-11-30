@@ -133,7 +133,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
     if cfg.logger.backend:
         exp_name = generate_exp_name("DQN", f"Atari_mnih15_{cfg.env.env_name}")
         logger = get_logger(
-            cfg.logger.backend, logger_name="dqn", experiment_name=exp_name
+            cfg.logger.backend, logger_name="dqn-atari", experiment_name=exp_name
         )
 
     # Create the test environment
@@ -199,7 +199,9 @@ def main(cfg: "DictConfig"):  # noqa: F821
             # Get and log q-values, loss, epsilon, sampling time and training time
             log_info.update(
                 {
-                    "train/q_values": (data["action_value"] * data["action"]).sum().item()
+                    "train/q_values": (data["action_value"] * data["action"])
+                    .sum()
+                    .item()
                     / frames_per_batch,
                     "train/q_loss": q_losses.mean().item(),
                     "train/epsilon": greedy_module.eps,
