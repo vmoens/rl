@@ -9,6 +9,8 @@ Deep Q-Learning Algorithm on Atari Environments.
 """
 
 import tempfile
+from copy import deepcopy
+
 import time
 from contextlib import nullcontext
 
@@ -16,6 +18,8 @@ import hydra
 import torch.nn
 import torch.optim
 import tqdm
+
+from tensordict import TensorDict
 from tensordict.nn import TensorDictSequential
 
 from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector
@@ -88,7 +92,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
 
     collector = collector_cls(
         create_env_fn=create_env_fn,
-        policy=model_explore.to(collector_device),
+        policy=deepcopy(model_explore).to(collector_device),
         frames_per_batch=frames_per_batch,
         total_frames=total_frames,
         device=collector_device,
@@ -181,7 +185,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
             for j in range(num_updates):
 
                 sampled_tensordict = replay_buffer.sample()
-                sampled_tensordict = sampled_tensordict.to(device)
+                sampled_tensordict = sampled_tensordict.to(device, non_blocking=True)
 
                 loss_td = loss_module(sampled_tensordict)
                 q_loss = loss_td["loss"]
@@ -231,9 +235,9 @@ def main(cfg: "DictConfig"):  # noqa: F821
 
         # Log all the information
         if logger:
+            logger.log_scalar("train/collected_frames", collected_frames, step=i)
             for key, value in log_info.items():
-                logger.log_scalar(key, value, step=i)
-            logger.log_scalar("collected_frames", collected_frames, step=i)
+                logger.log_scalar(key, value, step=collected_frames)
 
         # update weights of the inference policy
         collector.update_policy_weights_()
