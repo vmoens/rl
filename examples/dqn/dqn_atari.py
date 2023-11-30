@@ -20,7 +20,7 @@ from tensordict.nn import TensorDictSequential
 
 from torchrl.collectors import MultiaSyncDataCollector, SyncDataCollector
 from torchrl.data import LazyMemmapStorage, TensorDictReplayBuffer
-from torchrl.envs import ExplorationType, set_exploration_type, EnvCreator, ParallelEnv
+from torchrl.envs import EnvCreator, ExplorationType, ParallelEnv, set_exploration_type
 from torchrl.modules import EGreedyModule
 from torchrl.objectives import DQNLoss, HardUpdate
 from torchrl.record.loggers import generate_exp_name, get_logger
@@ -53,10 +53,26 @@ def main(cfg: "DictConfig"):  # noqa: F821
     ).to(device)
 
     # Create the collector
-    if cfg.collector.env_per_collectors <= 1:
-        create_env_fn=EnvCreator(lambda cfg=cfg, frame_skip=frame_skip: make_env(cfg.env.env_name, frame_skip, device=device))
+    if cfg.collector.device is None:
+        collector_device = device
     else:
-        create_env_fn=ParallelEnv(cfg.collector.env_per_collectors, EnvCreator(lambda cfg=cfg, frame_skip=frame_skip: make_env(cfg.env.env_name, frame_skip, "cpu")), device=device)
+        collector_device = cfg.collector.device
+    if cfg.collector.env_per_collectors <= 1:
+        create_env_fn = EnvCreator(
+            lambda cfg=cfg, frame_skip=frame_skip: make_env(
+                cfg.env.env_name, frame_skip, device=collector_device
+            )
+        )
+    else:
+        create_env_fn = ParallelEnv(
+            cfg.collector.env_per_collectors,
+            EnvCreator(
+                lambda cfg=cfg, frame_skip=frame_skip: make_env(
+                    cfg.env.env_name, frame_skip, "cpu"
+                )
+            ),
+            device=collector_device,
+        )
 
     if cfg.collector.num_collectors <= 1:
         collector_cls = SyncDataCollector
@@ -69,8 +85,8 @@ def main(cfg: "DictConfig"):  # noqa: F821
         policy=model_explore,
         frames_per_batch=frames_per_batch,
         total_frames=total_frames,
-        device=device,
-        storing_device=device,
+        device=collector_device,
+        storing_device=collector_device,
         max_frames_per_traj=-1,
         init_random_frames=init_random_frames,
     )

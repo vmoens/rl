@@ -12,6 +12,7 @@ collector:
   init_random_frames: 200_000
   env_per_collectors: 1
   num_collectors: 1
+  device:
 
 # buffer
 buffer:
