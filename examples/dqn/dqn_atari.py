@@ -147,6 +147,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
     num_updates = cfg.loss.num_updates
     max_grad = cfg.optim.max_grad_norm
     num_test_episodes = cfg.logger.num_test_episodes
+    train = False
     q_losses = torch.zeros(num_updates, device=device)
     pbar = tqdm.tqdm(total=total_frames)
     for data in collector:
@@ -159,38 +160,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
         collected_frames += current_frames
         greedy_module.step(current_frames)
         replay_buffer.extend(data)
-
-        # optimization steps
-        training_start = time.time()
-        for j in range(num_updates):
-
-            sampled_tensordict = replay_buffer.sample()
-            sampled_tensordict = sampled_tensordict.to(device)
-
-            loss_td = loss_module(sampled_tensordict)
-            q_loss = loss_td["loss"]
-            optimizer.zero_grad()
-            q_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(loss_module.parameters()), max_norm=max_grad
-            )
-            optimizer.step()
-            target_net_updater.step()
-            q_losses[j].copy_(q_loss.detach())
-
-        training_time = time.time() - training_start
-
-        # Get and log q-values, loss, epsilon, sampling time and training time
-        log_info.update(
-            {
-                "train/q_values": (data["action_value"] * data["action"]).sum().item()
-                / frames_per_batch,
-                "train/q_loss": q_losses.mean().item(),
-                "train/epsilon": greedy_module.eps,
-                "train/sampling_time": sampling_time,
-                "train/training_time": training_time,
-            }
-        )
+        train = train or (collected_frames >= init_random_frames * frame_skip)
 
         # Get and log training rewards and episode lengths
         episode_rewards = data["next", "episode_reward"][data["next", "done"]]
@@ -202,6 +172,39 @@ def main(cfg: "DictConfig"):  # noqa: F821
                 {
                     "train/episode_reward": episode_reward_mean,
                     "train/episode_length": episode_length_mean,
+                }
+            )
+
+        if train:
+            # optimization steps
+            training_start = time.time()
+            for j in range(num_updates):
+
+                sampled_tensordict = replay_buffer.sample()
+                sampled_tensordict = sampled_tensordict.to(device)
+
+                loss_td = loss_module(sampled_tensordict)
+                q_loss = loss_td["loss"]
+                optimizer.zero_grad()
+                q_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(loss_module.parameters()), max_norm=max_grad
+                )
+                optimizer.step()
+                target_net_updater.step()
+                q_losses[j].copy_(q_loss.detach())
+
+            training_time = time.time() - training_start
+
+            # Get and log q-values, loss, epsilon, sampling time and training time
+            log_info.update(
+                {
+                    "train/q_values": (data["action_value"] * data["action"]).sum().item()
+                    / frames_per_batch,
+                    "train/q_loss": q_losses.mean().item(),
+                    "train/epsilon": greedy_module.eps,
+                    "train/sampling_time": sampling_time,
+                    "train/training_time": training_time,
                 }
             )
 

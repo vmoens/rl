@@ -47,10 +47,10 @@ from torchrl.envs.utils import _replace_last, _sort_keys, _update_during_reset, 
 from torchrl.objectives.value.functional import reward2go
 
 try:
-    from torchvision.transforms.functional import center_crop
+    from torchvision.transforms.v2.functional import center_crop
 
     try:
-        from torchvision.transforms.functional import InterpolationMode, resize
+        from torchvision.transforms.v2.functional import InterpolationMode, resize
 
         def interpolation_fn(interpolation):  # noqa: D103
             return InterpolationMode(interpolation)
