@@ -150,7 +150,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
     train = False
     q_losses = torch.zeros(num_updates, device=device)
     pbar = tqdm.tqdm(total=total_frames)
-    for data in collector:
+    for i, data in enumerate(collector):
 
         log_info = {}
         sampling_time = time.time() - sampling_start
@@ -233,7 +233,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
         if logger:
             for key, value in log_info.items():
                 logger.log_scalar(key, value, step=collected_frames)
-            logger.log_scalar("collected_frames", collected_frames)
+            logger.log_scalar("collected_frames", collected_frames, step=i)
 
         # update weights of the inference policy
         collector.update_policy_weights_()
