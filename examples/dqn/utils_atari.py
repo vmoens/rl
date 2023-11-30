@@ -38,6 +38,10 @@ def make_env(env_name, frame_skip, device, is_test=False, transform=True):
         pixels_only=False,
         device=device,
     )
+    env = TransformedEnv(env)
+    env.append_transform(NoopResetEnv(noops=30, random=True))
+    if not is_test:
+        env.append_transform(EndOfLifeTransform())
     if transform:
         return transform_env(env, is_test=is_test)
     return env
@@ -45,9 +49,7 @@ def make_env(env_name, frame_skip, device, is_test=False, transform=True):
 
 def transform_env(env, is_test):
     env = TransformedEnv(env)
-    env.append_transform(NoopResetEnv(noops=30, random=True))
     if not is_test:
-        env.append_transform(EndOfLifeTransform())
         env.append_transform(RewardClipping(-1, 1))
     env.append_transform(ToTensorImage())
     env.append_transform(GrayScale())
