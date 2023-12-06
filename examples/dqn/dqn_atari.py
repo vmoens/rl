@@ -12,7 +12,6 @@ import tempfile
 from copy import deepcopy
 
 import time
-from contextlib import nullcontext
 
 import hydra
 import torch.nn
@@ -34,7 +33,7 @@ from utils_atari import eval_model, make_dqn_model, make_env, transform_env
 @hydra.main(config_path=".", config_name="config_atari", version_base="1.1")
 def main(cfg: "DictConfig"):  # noqa: F821
 
-    device = "cpu" if not torch.cuda.device_count() else "cuda:0"
+    device = torch.device(cfg.device)
 
     # Correct for frame_skip
     frame_skip = 4
@@ -179,10 +178,15 @@ def main(cfg: "DictConfig"):  # noqa: F821
                 }
             )
 
-        if train:
-            # optimization steps
-            training_start = time.time()
-            for j in range(num_updates):
+        if collected_frames < init_random_frames:
+            if logger:
+                for key, value in log_info.items():
+                    logger.log_scalar(key, value, step=collected_frames)
+            continue
+
+        # optimization steps
+        training_start = time.time()
+        for j in range(num_updates):
 
                 sampled_tensordict = replay_buffer.sample()
                 sampled_tensordict = sampled_tensordict.to(device, non_blocking=True)

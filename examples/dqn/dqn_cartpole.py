@@ -23,7 +23,7 @@ from utils_cartpole import eval_model, make_dqn_model, make_env
 @hydra.main(config_path=".", config_name="config_cartpole", version_base="1.1")
 def main(cfg: "DictConfig"):  # noqa: F821
 
-    device = "cpu" if not torch.cuda.device_count() else "cuda"
+    device = torch.device(cfg.device)
 
     # Make the components
     model = make_dqn_model(cfg.env.env_name)
@@ -97,6 +97,7 @@ def main(cfg: "DictConfig"):  # noqa: F821
     num_test_episodes = cfg.logger.num_test_episodes
     frames_per_batch = cfg.collector.frames_per_batch
     pbar = tqdm.tqdm(total=cfg.collector.total_frames)
+    init_random_frames = cfg.collector.init_random_frames
     sampling_start = time.time()
     q_losses = torch.zeros(num_updates, device=device)
 
@@ -110,6 +111,26 @@ def main(cfg: "DictConfig"):  # noqa: F821
         replay_buffer.extend(data)
         collected_frames += current_frames
         greedy_module.step(current_frames)
+
+        # Get and log training rewards and episode lengths
+        episode_rewards = data["next", "episode_reward"][data["next", "done"]]
+        if len(episode_rewards) > 0:
+            episode_reward_mean = episode_rewards.mean().item()
+            episode_length = data["next", "step_count"][data["next", "done"]]
+            episode_length_mean = episode_length.sum().item() / len(episode_length)
+            log_info.update(
+                {
+                    "train/episode_reward": episode_reward_mean,
+                    "train/episode_length": episode_length_mean,
+                }
+            )
+
+        if collected_frames < init_random_frames:
+            if collected_frames < init_random_frames:
+                if logger:
+                    for key, value in log_info.items():
+                        logger.log_scalar(key, value, step=collected_frames)
+                continue
 
         # optimization steps
         training_start = time.time()
@@ -136,19 +157,6 @@ def main(cfg: "DictConfig"):  # noqa: F821
                 "train/training_time": training_time,
             }
         )
-
-        # Get and log training rewards and episode lengths
-        episode_rewards = data["next", "episode_reward"][data["next", "done"]]
-        if len(episode_rewards) > 0:
-            episode_reward_mean = episode_rewards.mean().item()
-            episode_length = data["next", "step_count"][data["next", "done"]]
-            episode_length_mean = episode_length.sum().item() / len(episode_length)
-            log_info.update(
-                {
-                    "train/episode_reward": episode_reward_mean,
-                    "train/episode_length": episode_length_mean,
-                }
-            )
 
         # Get and log evaluation rewards and eval time
         with torch.no_grad(), set_exploration_type(ExplorationType.MODE):
