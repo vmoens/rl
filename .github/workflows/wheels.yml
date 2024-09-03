@@ -106,7 +106,7 @@ jobs:
         run: |
           python3 -mpip install numpy pytest pytest-cov codecov unittest-xml-reporting pillow>=4.1.1 scipy av networkx expecttest pyyaml
       - name: Download built wheels
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4.1.7
         with:
           name: torchrl-${{ matrix.os[0] }}-${{ matrix.python_version }}.whl
           path: /tmp/wheels

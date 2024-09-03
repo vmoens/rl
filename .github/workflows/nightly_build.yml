@@ -114,7 +114,7 @@ jobs:
         run: |
           python3 -mpip install numpy pytest --no-cache-dir
       - name: Download built wheels
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4.1.7
         with:
           name: torchrl-mac-${{ matrix.python_version[0] }}.whl
           path: /tmp/wheels
@@ -149,7 +149,7 @@ jobs:
       - name: Checkout torchrl
         uses: actions/checkout@v2
       - name: Download built wheels
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4.1.7
         with:
           name: torchrl-linux-${{ matrix.python_version[0] }}_${{ matrix.cuda_support[2] }}.whl
           path: /tmp/wheels
@@ -176,7 +176,7 @@ jobs:
       - name: Checkout torchrl
         uses: actions/checkout@v2
       - name: Download built wheels
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4.1.7
         with:
           name: torchrl-mac-${{ matrix.python_version[0] }}.whl
           path: /tmp/wheels
@@ -222,7 +222,7 @@ jobs:
           export PATH="/opt/python/${{ matrix.python_version[1] }}/bin:$PATH"
           python3 -mpip install numpy pytest pillow>=4.1.1 scipy networkx expecttest pyyaml
       - name: Download built wheels
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4.1.7
         with:
           name: torchrl-linux-${{ matrix.python_version[0] }}_${{ matrix.cuda_support[2] }}.whl
           path: /tmp/wheels
