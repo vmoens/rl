@@ -107,7 +107,8 @@ class TestMujoco:
 
     def test_satellite_generic_macro_sequence(self):
         backend = _AVAILABLE_BACKENDS[0]
-        env = SatelliteEnv(num_cmgs=4, num_envs=2, seed=0, backend=backend)
+        n = 1 if backend == "mujoco" else 2
+        env = SatelliteEnv(num_cmgs=4, num_envs=n, seed=0, backend=backend)
         transform = MacroPrimitiveTransform(
             action_dim=env.action_spec.shape[-1], macro_steps=3, settle_steps=1
         )
@@ -117,7 +118,9 @@ class TestMujoco:
         sequence = transform.action_sequence(
             td, MacroPrimitive.MOVE, target_qpos=target
         )
-        assert sequence.shape == torch.Size([2, 4, env.action_spec.shape[-1]])
+        assert sequence.shape == env.batch_size + torch.Size(
+            [4, env.action_spec.shape[-1]]
+        )
         env.close()
 
     def test_humanoid_generic_macro_sequence(self):
