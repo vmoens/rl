@@ -71,9 +71,14 @@ def split_by_env_index(
     The transitions of one environment keep their arrival order, which is
     their time order.
     """
+    # One densification and one stable sort, instead of one masked pass over
+    # the lazy stack per environment.
+    order = torch.argsort(env_index, stable=True)
+    dense = data.to_tensordict()[order]
+    indices, counts = torch.unique_consecutive(env_index[order], return_counts=True)
     return {
-        int(index): data[env_index == index].to_tensordict()
-        for index in env_index.unique().tolist()
+        int(index): chunk
+        for index, chunk in zip(indices.tolist(), dense.split(counts.tolist(), 0))
     }
 
 

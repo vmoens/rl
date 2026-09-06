@@ -235,7 +235,6 @@ class DreamerV3ReplayRecordBuilder:
                 f"{tuple(data.shape)} for {self.num_streams} streams."
             )
 
-        records = []
         record_keys = (
             "action",
             "is_init",
@@ -246,48 +245,61 @@ class DreamerV3ReplayRecordBuilder:
             ("next", "done"),
             ("next", "terminated"),
         )
-        for time_index in range(data.shape[1]):
-            collector_step = data[:, time_index]
-            reset = collector_step.get("is_init").reshape(self.num_streams, -1).any(-1)
-            insert_reset = reset if self._started else torch.zeros_like(reset)
-            if insert_reset.any() and not insert_reset.all():
-                raise RuntimeError(
-                    "The 2D DreamerV3 replay stream requires synchronized episode "
-                    "resets across collector environments."
-                )
-
-            transition = collector_step.select(*record_keys, strict=True).clone()
-            # This record models the transition into next.observation, so it
-            # keeps its action; the separate reset record marks the reset.
-            transition.get("is_init").zero_()
-            transition.set(
-                _REPLAY_CONTEXT_VALID_KEY,
-                torch.ones_like(transition.get("is_init"), dtype=torch.bool),
+        num_steps = data.shape[1]
+        if not num_steps:
+            return data.select(*record_keys, strict=True).clone()
+        reset = data.get("is_init").reshape(self.num_streams, num_steps, -1).any(-1)
+        insert_reset = reset.any(0)
+        unsynchronized = insert_reset & ~reset.all(0)
+        if not self._started:
+            # The first record of the stream needs no reset record before it.
+            insert_reset = insert_reset.clone()
+            insert_reset[0] = False
+            unsynchronized = unsynchronized.clone()
+            unsynchronized[0] = False
+        if unsynchronized.any():
+            raise RuntimeError(
+                "The 2D DreamerV3 replay stream requires synchronized episode "
+                "resets across collector environments."
             )
+        self._started = True
 
-            if insert_reset.any():
-                reset_transition = transition.clone()
-                for key in (
-                    "action",
-                    "state",
-                    "belief",
-                    ("next", "reward"),
-                    ("next", "done"),
-                    ("next", "terminated"),
-                ):
-                    reset_transition.get(key).zero_()
-                reset_transition.get("is_init").fill_(True)
-                for key in self.observation_keys:
-                    reset_transition.set(
-                        key,
-                        collector_step.get(self._root_key(key)).clone(),
-                    )
-                records.append(reset_transition)
+        transition = data.select(*record_keys, strict=True).clone()
+        # These records model the transitions into next.observation, so they
+        # keep their action; separate reset records mark the resets.
+        transition.get("is_init").zero_()
+        transition.set(
+            _REPLAY_CONTEXT_VALID_KEY,
+            torch.ones_like(transition.get("is_init"), dtype=torch.bool),
+        )
+        reset_steps = insert_reset.nonzero().squeeze(-1)
+        num_resets = reset_steps.numel()
+        if not num_resets:
+            return transition
 
-            records.append(transition)
-            self._started = True
+        reset_records = transition[:, reset_steps].clone()
+        for key in (
+            "action",
+            "state",
+            "belief",
+            ("next", "reward"),
+            ("next", "done"),
+            ("next", "terminated"),
+        ):
+            reset_records.get(key).zero_()
+        reset_records.get("is_init").fill_(True)
+        reset_sources = data[:, reset_steps]
+        for key in self.observation_keys:
+            reset_records.set(key, reset_sources.get(self._root_key(key)).clone())
 
-        return torch.stack(records, 1)
+        # Each reset record precedes the transition whose root observation it
+        # carries: transition t lands after the resets at or before t.
+        transition_positions = torch.arange(num_steps) + insert_reset.cumsum(0)
+        reset_positions = transition_positions[reset_steps] - 1
+        order = torch.empty(num_steps + num_resets, dtype=torch.long)
+        order[transition_positions] = torch.arange(num_steps)
+        order[reset_positions] = num_steps + torch.arange(num_resets)
+        return torch.cat([transition, reset_records], 1)[:, order]
 
 
 class DreamerV3ShiftedRecordExtender:
@@ -536,15 +548,23 @@ class DreamerV3ReplaySampler(SliceSampler):
             )
 
         max_time = storage._max_size_along_dim0()
-        for coordinate_row in coordinates:
-            self._stream_lengths.add_(1)
-            enqueue = (self._stream_lengths > self.slice_len) & (
-                (self._stream_lengths - 1).remainder(self.slice_len) == 0
+        num_rows = coordinates.shape[0]
+        if not num_rows:
+            return
+        # Every stream grows by one record per row, so the stream lengths stay
+        # equal: a row completes a block when the shared length passes a
+        # multiple of slice_len.
+        lengths = self._stream_lengths[0] + torch.arange(1, num_rows + 1)
+        completes_block = (lengths > self.slice_len) & (
+            (lengths - 1).remainder(self.slice_len) == 0
+        )
+        self._stream_lengths.add_(num_rows)
+        if completes_block.any():
+            starts = coordinates[completes_block].clone()
+            starts[..., 0].sub_(self.slice_len - 1).remainder_(max_time)
+            self._online_queue.extend(
+                starts.reshape(-1, coordinates.shape[-1]).unbind(0)
             )
-            if enqueue.any():
-                starts = coordinate_row[enqueue].clone()
-                starts[:, 0].sub_(self.slice_len - 1).remainder_(max_time)
-                self._online_queue.extend(starts.unbind(0))
 
     def _drop_stale_online(self, storage: LazyTensorStorage, seq_length: int) -> None:
         """Drop queued starts whose ``seq_length`` window is no longer stored."""

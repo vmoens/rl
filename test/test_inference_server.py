@@ -2558,6 +2558,20 @@ class TestSlotTransport:
                 assert "action" in r.keys()
                 assert r["action"].shape == (2,)
 
+    def test_drain_round_robin(self):
+        """Saturated drains rotate over the slots instead of favouring low ids."""
+        transport = SlotTransport(num_slots=6)
+        for slot in range(6):
+            transport._slot_submit(slot, TensorDict({"observation": torch.zeros(1)}))
+        _, first, _ = transport.drain_with_timing(4)
+        assert first == [0, 1, 2, 3]
+        for slot in range(4):
+            transport._slot_submit(slot, TensorDict({"observation": torch.zeros(1)}))
+        _, second, _ = transport.drain_with_timing(4)
+        assert second == [4, 5, 0, 1]
+        _, third, _ = transport.drain_with_timing(4)
+        assert third == [2, 3]
+
     def test_too_many_clients_raises(self):
         """Creating more clients than slots raises RuntimeError."""
         transport = SlotTransport(num_slots=2)

@@ -99,6 +99,10 @@ class SlotTransport(InferenceTransport):
         # Pre-allocated observation buffer (lazily initialised)
         self._obs_buffer: TensorDictBase | None = None
 
+        # Slot after the last one served: sweeps rotate over the actors so a
+        # saturated server (more ready slots than max_items) stays fair.
+        self._sweep_start = 0
+
     # -- actor (env-thread) API -----------------------------------------------
 
     def _slot_submit(self, slot_id: int, td: TensorDictBase) -> None:
@@ -180,7 +184,9 @@ class SlotTransport(InferenceTransport):
         items: list[TensorDictBase] = []
         slot_ids: list[int] = []
         submitted_at: list[float | None] = []
-        for i in range(self._num_slots):
+        start = self._sweep_start
+        for offset in range(self._num_slots):
+            i = (start + offset) % self._num_slots
             if self._obs_ready[i]:
                 self._obs_ready[i] = False
                 submitted_at.append(self._submitted_at[i])
@@ -198,6 +204,8 @@ class SlotTransport(InferenceTransport):
                 slot_ids.append(i)
                 if len(slot_ids) >= max_items:
                     break
+        if slot_ids:
+            self._sweep_start = (slot_ids[-1] + 1) % self._num_slots
         return items, slot_ids, submitted_at
 
     def resolve(self, callback: int, result: TensorDictBase) -> None:

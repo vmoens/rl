@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 import torch
 from _objectives_common import LossModuleTestBase
-from tensordict import TensorDict
+from tensordict import lazy_stack, TensorDict
 from tensordict.nn import (
     InteractionType,
     ProbabilisticTensorDictModule,
@@ -29,7 +29,7 @@ from tensordict.nn import (
 )
 from torch import nn
 
-from torchrl.data import Unbounded
+from torchrl.data import LazyTensorStorage, ReplayBuffer, RoundRobinWriter, Unbounded
 from torchrl.envs.model_based.dreamer import DreamerEnv
 from torchrl.envs.transforms import TensorDictPrimer, TransformedEnv
 from torchrl.modules import SafeSequential, SymExpTwoHot, WorldModelWrapper
@@ -2034,3 +2034,178 @@ def test_dreamer_v3_dmc_reproduction_modes(tmp_path):
     )
     assert incompatible.returncode == 2
     assert "mutually exclusive" in incompatible.stderr
+
+
+@pytest.mark.skipif(not _has_omegaconf, reason="requires omegaconf")
+class TestDreamerV3SotaReplayIngestion:
+    """The vectorised replay ingestion of the example matches its per-step reference."""
+
+    @staticmethod
+    def _load_module(monkeypatch, name: str):
+        example_dir = Path(__file__).parents[2] / "sota-implementations/dreamer_v3"
+        monkeypatch.syspath_prepend(str(example_dir))
+        return importlib.import_module(name)
+
+    @staticmethod
+    def _collector_batch(num_streams, num_steps, reset_steps, generator):
+        def randn(*feature_shape):
+            return torch.randn(
+                num_streams, num_steps, *feature_shape, generator=generator
+            )
+
+        is_init = torch.zeros(num_streams, num_steps, 1, dtype=torch.bool)
+        is_init[:, list(reset_steps)] = True
+        return TensorDict(
+            {
+                "action": randn(3),
+                "is_init": is_init,
+                "state": randn(4),
+                "belief": randn(5),
+                "observation": randn(2),
+                "next": TensorDict(
+                    {
+                        "observation": randn(2),
+                        "reward": randn(1),
+                        "done": randn(1) > 0.5,
+                        "terminated": randn(1) > 0.8,
+                    },
+                    [num_streams, num_steps],
+                ),
+            },
+            [num_streams, num_steps],
+        )
+
+    @staticmethod
+    def _reference_records(data, started, context_valid_key):
+        """The per-time-step loop the vectorised builder replaced."""
+        record_keys = (
+            "action",
+            "is_init",
+            "state",
+            "belief",
+            ("next", "observation"),
+            ("next", "reward"),
+            ("next", "done"),
+            ("next", "terminated"),
+        )
+        records = []
+        for time_index in range(data.shape[1]):
+            step = data[:, time_index]
+            reset = step.get("is_init").reshape(data.shape[0], -1).any(-1)
+            insert_reset = reset if started else torch.zeros_like(reset)
+            transition = step.select(*record_keys, strict=True).clone()
+            transition.get("is_init").zero_()
+            transition.set(
+                context_valid_key,
+                torch.ones_like(transition.get("is_init"), dtype=torch.bool),
+            )
+            if insert_reset.any():
+                reset_transition = transition.clone()
+                for key in (
+                    "action",
+                    "state",
+                    "belief",
+                    ("next", "reward"),
+                    ("next", "done"),
+                    ("next", "terminated"),
+                ):
+                    reset_transition.get(key).zero_()
+                reset_transition.get("is_init").fill_(True)
+                reset_transition.set(
+                    ("next", "observation"), step.get("observation").clone()
+                )
+                records.append(reset_transition)
+            records.append(transition)
+            started = True
+        return torch.stack(records, 1)
+
+    @staticmethod
+    def _assert_same(actual, expected):
+        assert actual.batch_size == expected.batch_size
+        assert set(actual.keys(True, True)) == set(expected.keys(True, True))
+        for key in expected.keys(True, True):
+            assert (actual.get(key) == expected.get(key)).all(), key
+
+    @pytest.mark.parametrize("num_streams", [1, 2])
+    def test_record_builder_matches_reference(self, monkeypatch, num_streams):
+        replay = self._load_module(monkeypatch, "dreamer_v3_replay")
+        generator = torch.Generator().manual_seed(0)
+        builder = replay.DreamerV3ReplayRecordBuilder(num_streams)
+        started = False
+        # Resets at the very first step (no record), at the first step of a
+        # later batch, at the last step, and no reset at all.
+        for reset_steps in ((0, 3), (0, 2, 5), ()):
+            batch = self._collector_batch(num_streams, 6, reset_steps, generator)
+            expected = self._reference_records(
+                batch, started, replay._REPLAY_CONTEXT_VALID_KEY
+            )
+            actual = builder(batch.reshape(-1) if num_streams == 1 else batch)
+            assert actual.shape[1] == 6 + len(reset_steps) - (not started)
+            self._assert_same(actual, expected)
+            started = True
+        if num_streams > 1:
+            batch = self._collector_batch(num_streams, 4, (), generator)
+            batch["is_init"][0, 2] = True
+            with pytest.raises(RuntimeError, match="synchronized"):
+                builder(batch)
+
+    @pytest.mark.parametrize("ndim", [1, 2])
+    def test_sampler_online_queue_matches_reference(self, monkeypatch, ndim):
+        replay = self._load_module(monkeypatch, "dreamer_v3_replay")
+        slice_len, max_time = 4, 12
+        num_streams = 3 if ndim == 2 else 1
+        sampler = replay.DreamerV3ReplaySampler(slice_len=slice_len, online=True)
+        buffer = ReplayBuffer(
+            storage=LazyTensorStorage(max_size=max_time * num_streams, ndim=ndim),
+            sampler=sampler,
+            writer=RoundRobinWriter(),
+            batch_size=slice_len,
+        )
+        reference_queue = []
+        reference_lengths = torch.zeros(num_streams, dtype=torch.long)
+        # More rows than max_time, so the start coordinates wrap around.
+        for num_rows in (3, 5, 1, 7, 2):
+            shape = [num_streams, num_rows] if ndim == 2 else [num_rows]
+            records = TensorDict({"x": torch.randn(*shape, 2)}, shape)
+            index = torch.as_tensor(buffer.extend(records), dtype=torch.long)
+            sampler.observe_extend(index, buffer.storage)
+            coordinates = index.reshape(-1, num_streams, ndim)
+            assert buffer.storage._max_size_along_dim0() == max_time
+            for coordinate_row in coordinates:
+                reference_lengths.add_(1)
+                enqueue = (reference_lengths > slice_len) & (
+                    (reference_lengths - 1).remainder(slice_len) == 0
+                )
+                if enqueue.any():
+                    starts = coordinate_row[enqueue].clone()
+                    starts[:, 0].sub_(slice_len - 1).remainder_(max_time)
+                    reference_queue.extend(starts.unbind(0))
+        assert torch.equal(sampler._stream_lengths, reference_lengths)
+        assert len(reference_queue) == 4 * num_streams
+        assert torch.equal(
+            torch.stack(sampler._online_queue), torch.stack(reference_queue)
+        )
+
+    def test_split_by_env_index_matches_masking(self, monkeypatch):
+        utils = self._load_module(monkeypatch, "dreamer_v3_utils")
+        env_index = torch.tensor([2, 0, 2, 1, 0, 2, 5])
+        data = lazy_stack(
+            [
+                TensorDict(
+                    {
+                        "observation": torch.full((3,), float(position)),
+                        ("next", "reward"): torch.tensor([float(position)]),
+                    },
+                    [],
+                )
+                for position in range(env_index.numel())
+            ]
+        )
+        expected = {
+            int(index): data[env_index == index].to_tensordict()
+            for index in env_index.unique().tolist()
+        }
+        actual = utils.split_by_env_index(data, env_index)
+        assert actual.keys() == expected.keys()
+        for index, chunk in expected.items():
+            self._assert_same(actual[index], chunk)
