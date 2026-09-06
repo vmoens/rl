@@ -30,6 +30,8 @@ from torchrl.modules.models.model_based import (
     DreamerActor,
     DreamerV3BlockGRU,
     DreamerV3BlockGRUCell,
+    DreamerV3ImageDecoder,
+    DreamerV3ImageEncoder,
     DreamerV3MLP,
     ObsDecoder,
     ObsEncoder,
@@ -368,6 +370,45 @@ class TestDreamerV3Components:
         torch.testing.assert_close(output, torch.zeros_like(output))
 
     @pytest.mark.parametrize("device", get_default_devices())
+    def test_image_encoder_decoder(self, device):
+        encoder = DreamerV3ImageEncoder(
+            depth=4, mults=(1, 2), kernel_size=5, device=device
+        )
+        image = torch.randint(
+            0, 256, (2, 3, 3, 16, 16), dtype=torch.uint8, device=device
+        )
+        features = encoder(image)
+        # Two stride-2 stages: 16x16 -> 4x4 with 4 * 2 channels.
+        assert encoder.output_features((3, 16, 16)) == 8 * 4 * 4
+        assert features.shape == (2, 3, 128)
+        # uint8 and [0, 1] float inputs are the same image.
+        torch.testing.assert_close(features, encoder(image.float() / 255.0))
+
+        decoder = DreamerV3ImageDecoder(
+            in_features=6 + 10,
+            image_shape=(3, 16, 16),
+            depth=4,
+            mults=(1, 2),
+            kernel_size=5,
+            num_blocks=2,
+            device=device,
+        )
+        state = torch.randn(2, 3, 6, device=device, requires_grad=True)
+        belief = torch.randn(2, 3, 10, device=device)
+        reco = decoder(state, belief)
+        assert reco.shape == (2, 3, 3, 16, 16)
+        reco.sum().backward()
+        assert state.grad.abs().sum() > 0
+        dense = DreamerV3ImageDecoder(
+            in_features=16, image_shape=(3, 16, 16), depth=4, mults=(1, 2), num_blocks=1
+        )
+        assert isinstance(dense.projection, torch.nn.Linear)
+        with pytest.raises(ValueError, match="divisible"):
+            DreamerV3ImageDecoder(
+                in_features=16, image_shape=(3, 12, 16), mults=(1, 2, 3)
+            )
+
+    @pytest.mark.parametrize("device", get_default_devices())
     def test_block_gru_reference_fixture(self, device):
         prior = RSSMPriorV3(
             action_shape=(2,),
@@ -657,6 +698,17 @@ class TestDreamerV3Components:
         assert state.grad is not None
         assert belief.grad is not None
         assert all(parameter.grad is not None for parameter in prior.parameters())
+
+        # One-hot action specs sample boolean actions; the prior casts them.
+        one_hot = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]], device=device)
+        torch.manual_seed(0)
+        float_logits, _, float_belief = prior(state.detach(), belief.detach(), one_hot)
+        torch.manual_seed(0)
+        bool_logits, _, bool_belief = prior(
+            state.detach(), belief.detach(), one_hot.bool()
+        )
+        torch.testing.assert_close(bool_logits, float_logits)
+        torch.testing.assert_close(bool_belief, float_belief)
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse("2.4.0"),

@@ -51,7 +51,15 @@ from torchrl.data.replay_buffers.writers import (
 )
 from torchrl.envs import AsyncEnvPool, ParallelEnv, SerialEnv
 from torchrl.envs.libs.vmas import VmasEnv
-from torchrl.modules import ConvNet, DreamerV3MLP, MLP, TanhModule, ValueOperator
+from torchrl.modules import (
+    ConvNet,
+    DreamerV3ImageDecoder,
+    DreamerV3ImageEncoder,
+    DreamerV3MLP,
+    MLP,
+    TanhModule,
+    ValueOperator,
+)
 from torchrl.modules.tensordict_module.exploration import AdditiveGaussianModule
 from torchrl.objectives.ppo import ClipPPOLoss, KLPENPPOLoss, PPOLoss
 from torchrl.record.loggers import (
@@ -68,6 +76,8 @@ try:
     from torchrl.trainers.algorithms import configs as algorithm_configs
     from torchrl.trainers.algorithms.configs.modules import (
         ActivationConfig,
+        DreamerV3ImageDecoderConfig,
+        DreamerV3ImageEncoderConfig,
         DreamerV3MLPConfig,
         LayerConfig,
     )
@@ -76,6 +86,7 @@ try:
 except ImportError:
     _configs_available = False
     ActivationConfig = DreamerV3MLPConfig = LayerConfig = None
+    DreamerV3ImageDecoderConfig = DreamerV3ImageEncoderConfig = None
 
 
 _has_gym = (importlib.util.find_spec("gym") is not None) or (
@@ -1184,6 +1195,30 @@ class TestModuleConfigs:
         assert isinstance(module, DreamerV3MLP)
         output = module(torch.randn(3, 2), torch.randn(3, 4))
         assert output.shape == (3, expected_features)
+
+    @pytest.mark.skipif(not _has_hydra, reason="Hydra is not installed")
+    def test_dreamer_v3_image_configs(self):
+        """Test DreamerV3ImageEncoderConfig and DreamerV3ImageDecoderConfig."""
+        from hydra.utils import instantiate
+
+        encoder = instantiate(
+            DreamerV3ImageEncoderConfig(depth=4, mults=[1, 2], device="cpu")
+        )
+        assert isinstance(encoder, DreamerV3ImageEncoder)
+        image = torch.randint(0, 256, (3, 3, 16, 16), dtype=torch.uint8)
+        assert encoder(image).shape == (3, 8 * 4 * 4)
+        decoder = instantiate(
+            DreamerV3ImageDecoderConfig(
+                in_features=12,
+                image_shape=[3, 16, 16],
+                depth=4,
+                mults=[1, 2],
+                num_blocks=2,
+                device="cpu",
+            )
+        )
+        assert isinstance(decoder, DreamerV3ImageDecoder)
+        assert decoder(torch.randn(3, 12)).shape == (3, 3, 16, 16)
 
     @pytest.mark.skipif(not _has_hydra, reason="Hydra is not installed")
     def test_convnet_config(self):
