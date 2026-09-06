@@ -2224,6 +2224,33 @@ class TestAsyncBatchedCollector:
         assert total_collected >= total_frames
         assert stats["requests"] > 0
 
+    def test_multiprocessing_shm_exchange(self):
+        """Env processes exchange fixed-shape transitions through shared slots."""
+        num_envs = 2
+        total_frames = 40
+        collector = AsyncBatchedCollector(
+            create_env_fn=[_counting_env_factory] * num_envs,
+            policy=_make_counting_policy(),
+            frames_per_batch=10,
+            total_frames=total_frames,
+            max_batch_size=num_envs,
+            env_backend="multiprocessing",
+            env_exchange="shm",
+        )
+        try:
+            total_collected = sum(batch.numel() for batch in collector)
+        finally:
+            collector.shutdown()
+        assert total_collected >= total_frames
+        with pytest.raises(ValueError, match="require env_backend"):
+            AsyncBatchedCollector(
+                create_env_fn=[_counting_env_factory],
+                policy=_make_counting_policy(),
+                frames_per_batch=1,
+                env_backend="threading",
+                env_exchange="shm",
+            )
+
     def test_bounded_result_queue(self):
         """A bounded result queue throttles the envs but loses no frame."""
         num_envs = 3

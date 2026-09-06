@@ -871,6 +871,11 @@ class TestAsyncEnvPool:
     def test_specs(self, backend, make_envs):
         env = self.make_env(makers=make_envs, backend=backend)
         assert env.batch_size == (4,)
+        if backend == "multiprocessing":
+            # Known at setup from the worker specs: no worker round trip, which
+            # concurrent per-env callers would otherwise race on.
+            assert env._env_batch_sizes == [torch.Size([])] * 4
+        assert env.env_batch_sizes == [torch.Size([])] * 4
         try:
             r = env.reset()
             assert r.shape == env.shape

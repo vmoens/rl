@@ -29,6 +29,9 @@ collector:
   # threads while an inference server batches policy calls.
   policy_device: null  # device of the inference server, null = training device
   env_backend: multiprocessing  # one of: multiprocessing, threading
+  # Data exchange with multiprocessing env workers: queue (shared tensors per
+  # transition) or shm (one fixed shared slot per env, bounded mappings).
+  env_exchange: queue
   inference_max_batch_size: 16
   inference_min_batch_size: 1
   inference_timeout: 0.01

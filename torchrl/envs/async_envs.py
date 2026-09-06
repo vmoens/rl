@@ -704,6 +704,10 @@ class ProcessorAsyncEnvPool(AsyncEnvPool):
         self._child_specs = []
         for i in range(num_threads):
             self._child_specs.append(self.output_queue[i].get())
+        # The batch sizes come with the specs: resolving them lazily through the
+        # worker queues would block behind a worker busy with a long reset, and
+        # concurrent per-env callers would race on the shared queues.
+        self._env_batch_sizes = [torch.Size(spec.shape) for spec in self._child_specs]
         specs = torch.stack(list(self._child_specs))
         output_spec = specs["output_spec"]
         input_spec = specs["input_spec"]
@@ -744,6 +748,17 @@ class ProcessorAsyncEnvPool(AsyncEnvPool):
                 batch_sizes.append(self.output_queue[_env_idx].get())
             self._env_batch_sizes = batch_sizes
         return batch_sizes
+
+    @property
+    def exchange_keys(self) -> frozenset | None:
+        """The fixed leaf keys of the shared-slot exchange, or ``None`` with the queue exchange.
+
+        Inputs sent to the workers through the shared slots must only carry
+        these keys; callers with extra entries select them out first.
+        """
+        if self._slot_exchange is None:
+            return None
+        return frozenset(self._slot_exchange._input_keys)
 
     def _prepare_worker_data(
         self,

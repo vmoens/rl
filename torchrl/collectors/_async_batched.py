@@ -93,6 +93,18 @@ def _env_loop(
     if client is None:
         client = transport.client()
 
+    # A shared-slot exchange has a fixed schema: policy outputs the env does
+    # not consume (log-probabilities, policy version, ...) must not reach it.
+    exchange_keys = getattr(pool, "exchange_keys", None)
+
+    def env_input(tensordict: TensorDictBase) -> TensorDictBase:
+        if exchange_keys is None:
+            return tensordict
+        return tensordict.select(
+            *(key for key in tensordict.keys(True, True) if key in exchange_keys),
+            strict=False,
+        )
+
     try:
         pool.async_reset_send(env_index=env_id)
         obs = pool.async_reset_recv(env_index=env_id)
@@ -101,7 +113,7 @@ def _env_loop(
         while not shutdown_event.is_set():
             if env_device is not None:
                 action_td = action_td.to(env_device)
-            pool.async_step_and_maybe_reset_send(action_td, env_index=env_id)
+            pool.async_step_and_maybe_reset_send(env_input(action_td), env_index=env_id)
             cur_td, next_obs = pool.async_step_and_maybe_reset_recv(env_index=env_id)
             cur_td.set(_ENV_IDX_KEY, env_id)
             if storing_device is not None:
@@ -210,6 +222,14 @@ class AsyncBatchedCollector(BaseCollector):
             of ``"threading"`` or ``"multiprocessing"``.  Falls back to
             ``backend`` when ``None``.  The coordinator threads are always
             Python threads regardless of this setting.  Defaults to ``None``.
+        env_exchange (str, optional): data exchange of a multiprocessing
+            :class:`~torchrl.envs.AsyncEnvPool`, one of ``"queue"``,
+            ``"shm"`` or ``"auto"``.  ``"queue"`` ships every transition as
+            shared tensors through the worker queues; ``"shm"`` keeps one
+            fixed shared slot per environment and only passes readiness
+            descriptors, which bounds the number of shared-memory mappings
+            when many environments produce many small tensors.  Defaults to
+            ``"queue"``.
         policy_backend (str, optional): backend for the inference transport
             used to communicate with the
             :class:`~torchrl.modules.InferenceServer`.  One of
@@ -283,6 +303,7 @@ class AsyncBatchedCollector(BaseCollector):
             "threading", "multiprocessing", "ray", "monarch"
         ] = "threading",
         env_backend: Literal["threading", "multiprocessing"] | None = None,
+        env_exchange: Literal["queue", "shm", "auto"] = "queue",
         policy_backend: Literal["threading", "multiprocessing", "ray", "monarch"]
         | None = None,
         reset_at_each_iter: bool = False,
@@ -362,6 +383,16 @@ class AsyncBatchedCollector(BaseCollector):
                 f"Expected one of {_ENV_BACKENDS}."
             )
         self._env_backend = effective_env_backend
+        if env_exchange not in ("queue", "shm", "auto"):
+            raise ValueError(
+                f"env_exchange={env_exchange!r} is not supported. Expected one of "
+                "('queue', 'shm', 'auto')."
+            )
+        if env_exchange != "queue" and effective_env_backend != "multiprocessing":
+            raise ValueError(
+                "env_exchange='shm' and 'auto' require env_backend='multiprocessing'."
+            )
+        self._env_exchange = env_exchange
         self._server_backend = server_backend
         if server_backend == "process":
             if policy_backend not in (None, "multiprocessing"):
@@ -454,10 +485,9 @@ class AsyncBatchedCollector(BaseCollector):
         self._env_pool = AsyncEnvPool(
             self._create_env_fn,
             backend=self._env_backend,
-            # Pinned to the current default so the pool's default-change
-            # FutureWarning is not emitted from library code; switching the
-            # collector to the shm exchange is a deliberate follow-up.
-            exchange="queue",
+            # Explicit so the pool's default-change FutureWarning is not
+            # emitted from library code.
+            exchange=self._env_exchange,
             **kwargs,
         )
 

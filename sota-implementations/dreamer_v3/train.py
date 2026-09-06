@@ -538,6 +538,7 @@ def _build_collection(
             frames_per_batch=cfg.collector.frames_per_batch,
             total_frames=collector_action_frames,
             env_backend=cfg.collector.env_backend,
+            env_exchange=cfg.collector.get("env_exchange", "queue"),
             policy_backend="threading",
             device_config=InferenceDeviceConfig(
                 policy_device=policy_device,
