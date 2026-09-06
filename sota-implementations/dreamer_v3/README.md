@@ -131,7 +131,13 @@ time and graph size, while `1` disables manual unrolling.
 `optimization.cudagraph_train_step=true` captures the learner forward and
 backward after five warmup calls. It requires CUDA and fixed input shapes;
 optimizer and target-network steps remain outside capture so their schedules
-continue to advance normally.
+continue to advance normally. With either option on, the learner step is
+compiled and captured on a spec-shaped fake batch before collection starts
+(`optimization.compile_warmup`, on by default in that case); parameters,
+normalizer statistics and target networks are restored afterwards, and the
+optimizer does not step. Compiling while the asynchronous collector runs would
+otherwise share the interpreter with its threads and idle the environments for
+the whole compile.
 
 ## Images, discrete actions and asynchronous collection
 

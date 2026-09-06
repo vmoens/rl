@@ -46,6 +46,7 @@ from dreamer_v3_agent import (
     vector_key as configured_vector_key,
 )
 from dreamer_v3_replay import (
+    _REPLAY_CONTEXT_VALID_KEY,
     collector_action_budget,
     DreamerV3ReplayPipeline,
     DreamerV3ReplayRecordBuilder,
@@ -179,6 +180,7 @@ class _LearnerUpdate:
             for group in learner.optimizer.param_groups
             for parameter in group["params"]
         ]
+        self.cudagraph_warmup = cudagraph_warmup
         train_step = self._forward_backward
         if cfg.optimization.cudagraph_train_step:
             if device.type != "cuda":
@@ -312,6 +314,82 @@ class _LearnerUpdate:
         self.optimizer.step()
         self.value_target_updater.step()
         return result
+
+
+def _compile_warmup_enabled(cfg: DictConfig) -> bool:
+    value = cfg.optimization.get("compile_warmup", None)
+    if value is None:
+        return bool(
+            cfg.optimization.compile_rssm or cfg.optimization.cudagraph_train_step
+        )
+    return bool(value)
+
+
+def _fake_learner_sample(
+    cfg: DictConfig,
+    layout: ObservationLayout,
+    state_dim: int,
+    action_dim: int,
+) -> TensorDictBase:
+    """A replay-shaped batch built from the environment specs.
+
+    It carries exactly the keys of a replay sample, so a learner step on it
+    compiles and captures the same graphs as the real updates.
+    """
+    primed_env = make_primed_env(cfg, cfg.env.seed + 3, state_dim, action_dim)
+    keys = (
+        "action",
+        "is_init",
+        "state",
+        "belief",
+        *layout.observation_keys,
+        ("next", "reward"),
+        ("next", "done"),
+        ("next", "terminated"),
+    )
+    sample = (
+        primed_env.fake_tensordict()
+        .select(*keys, strict=True)
+        .expand(cfg.replay_buffer.batch_size, cfg.replay_buffer.seq_len)
+        .clone()
+    )
+    sample.set(
+        _REPLAY_CONTEXT_VALID_KEY,
+        torch.ones(*sample.batch_size, 1, dtype=torch.bool),
+    )
+    return sample
+
+
+def _warm_up_learner(
+    cfg: DictConfig,
+    device: torch.device,
+    learner: _Learner,
+    learner_update: _LearnerUpdate,
+    layout: ObservationLayout,
+    state_dim: int,
+    action_dim: int,
+) -> None:
+    """Compile and graph-capture the learner step before collection starts.
+
+    A compile that overlaps with collection would share the interpreter with
+    the collector threads (torch's compilation flag is process-wide), and the
+    environments would idle for the whole compile. The forward and backward
+    passes run on a fake batch; parameters, normalizer statistics and target
+    networks are restored afterwards and the optimizer never steps.
+    """
+    calls = 1
+    if cfg.optimization.cudagraph_train_step:
+        calls = learner_update.cudagraph_warmup + 1
+    modules = torch.nn.ModuleList(
+        [learner.model_loss, learner.actor_loss, learner.value_loss]
+    )
+    state = {key: value.detach().clone() for key, value in modules.state_dict().items()}
+    with torch.random.fork_rng(devices=[device] if device.type == "cuda" else []):
+        sample = _fake_learner_sample(cfg, layout, state_dim, action_dim).to(device)
+        for _ in range(calls):
+            learner_update.train_step(sample)
+    learner_update.optimizer.zero_grad(set_to_none=True)
+    modules.load_state_dict(state)
 
 
 def _validated_action_budget(cfg: DictConfig) -> int:
@@ -955,6 +1033,15 @@ def main(cfg: DictConfig):
         layout.pixels_shape,
     )
     learner_update = _LearnerUpdate(cfg, device, learner)
+    if _compile_warmup_enabled(cfg):
+        with timeit("dreamer_v3/compile_warmup") as warmup_timer:
+            _warm_up_learner(
+                cfg, device, learner, learner_update, layout, state_dim, action_dim
+            )
+        torchrl_logger.info(
+            "Learner compiled and captured before collection in %.1f s",
+            warmup_timer.elapsed(),
+        )
 
     collector, behavior_policy_sync = _build_collection(
         cfg, device, learner, state_dim, action_dim, collector_action_frames
