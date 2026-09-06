@@ -598,7 +598,14 @@ def _build_collection(
         collector_actor.to(policy_device)
         served_policy = collector_policy
         if cfg.collector.compile_policy:
-            served_policy = torch.compile(collector_policy, dynamic=True)
+            served_policy = _compile_policy(
+                cfg,
+                collector_policy,
+                state_dim,
+                action_dim,
+                policy_device,
+                cfg.collector.inference_max_batch_size,
+            )
         cpu = torch.device("cpu")
         collector = AsyncBatchedCollector(
             create_env_fn=[
@@ -667,6 +674,37 @@ def _build_collection(
         # The collector's construction-time policy call is not an action.
         collector_policy.reset_counter()
     return collector, behavior_policy_sync
+
+
+def _compile_policy(
+    cfg: DictConfig,
+    policy: TensorDictModuleBase,
+    state_dim: int,
+    action_dim: int,
+    device: torch.device,
+    max_batch_size: int,
+) -> TensorDictModuleBase:
+    """Compile the acting policy and trace it for the served batch sizes.
+
+    Tracing happens before the collector starts any thread. A compilation
+    failure costs the speedup, not the run: the eager policy is served instead.
+    """
+    compiled = torch.compile(policy, dynamic=True)
+    primed_env = make_primed_env(cfg, cfg.env.seed + 4, state_dim, action_dim)
+    fake = primed_env.fake_tensordict().select(*policy.in_keys, strict=False)
+    try:
+        with torch.no_grad(), torch.random.fork_rng(
+            devices=[device] if device.type == "cuda" else []
+        ):
+            for batch in sorted({1, 2, max_batch_size}):
+                compiled(fake.expand(batch).clone().to(device))
+    except Exception as error:
+        torchrl_logger.warning(
+            "Compiling the acting policy failed (%s); serving the eager policy.",
+            error,
+        )
+        return policy
+    return compiled
 
 
 def _apply_behavior_sync(
@@ -889,7 +927,14 @@ def _log_train_window(
     replay_stats: dict[str, float],
     server_stats: dict[str, float],
 ) -> None:
-    metrics = (loss_window_sum / max(loss_window_updates, 1)).cpu().tolist()
+    # Loss averages are only meaningful once the window holds updates.
+    metrics = (
+        dict(
+            zip(UPDATE_METRICS, (loss_window_sum / loss_window_updates).cpu().tolist())
+        )
+        if loss_window_updates
+        else {}
+    )
     timings = {
         f"time_{name.replace('/', '_')}": value
         for name, value in timeit.todict(percall=True).items()
@@ -901,7 +946,7 @@ def _log_train_window(
             "action_steps": action_step,
             "updates": update_step,
             "updates_in_window": loss_window_updates,
-            **dict(zip(UPDATE_METRICS, metrics)),
+            **metrics,
             **throughput,
             **{f"replay_{key}": value for key, value in replay_stats.items()},
             **{f"inference_{key}": value for key, value in server_stats.items()},
@@ -1097,6 +1142,9 @@ def main(cfg: DictConfig):
     )
     throughput = _ThroughputWindow(run_timer, records_per_update)
     max_time = cfg.optimization.max_time
+    collection_warmup_seconds = (
+        cfg.optimization.get("collection_warmup_seconds", 0) or 0
+    )
     stop_reason = "frame_budget"
 
     if cfg.optimization.separate_policy_rng:
@@ -1147,16 +1195,22 @@ def main(cfg: DictConfig):
             with timeit("dreamer_v3/replay_sample"):
                 replay_pipeline.prefetch(replay)
 
-        if len(replay) < warmup or not replay_ready:
-            continue
-
-        batch_updates = (
-            update_ratio(record_step) if update_ratio is not None else updates_per_batch
+        # Collection runs unthrottled until replay is warm and the optional
+        # collection-only phase has elapsed; updates are scheduled from then on.
+        training_ready = (
+            len(replay) >= warmup
+            and replay_ready
+            and run_timer.elapsed() >= collection_warmup_seconds
         )
-        if not batch_updates:
-            continue
+        batch_updates = 0
+        if training_ready:
+            batch_updates = (
+                update_ratio(record_step)
+                if update_ratio is not None
+                else updates_per_batch
+            )
 
-        if behavior_policy_sync is not None:
+        if batch_updates and behavior_policy_sync is not None:
             # Stage one time per batch; more updates keep the pending snapshot.
             behavior_policy_sync.stage_before_training()
 
@@ -1189,7 +1243,7 @@ def main(cfg: DictConfig):
                 )
             update_step += 1
 
-        if record_loss_history:
+        if record_loss_history and batch_updates:
             loss_history.append(batch_losses.cpu())
 
         train_log_due = bool(
@@ -1203,7 +1257,10 @@ def main(cfg: DictConfig):
             )
         )
         eval_due = bool(
-            eval_env is not None and cfg.logger.eval_every and record_step >= next_eval
+            batch_updates
+            and eval_env is not None
+            and cfg.logger.eval_every
+            and record_step >= next_eval
         )
         latest_losses = batch_losses[-1].cpu() if eval_due else None
         if train_log_due:

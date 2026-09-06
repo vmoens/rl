@@ -94,6 +94,9 @@ optimization:
   # Compile and capture the learner on a fake batch before collection starts.
   # null enables it whenever compile_rssm or cudagraph_train_step is set.
   compile_warmup: null
+  # Collect without training for this many seconds first: measures the
+  # environment and inference throughput before the learner gates collection.
+  collection_warmup_seconds: 0
   lr: 4.0e-5
   optimizer_eps: 1.0e-20
   adaptive_grad_clip: 0.3

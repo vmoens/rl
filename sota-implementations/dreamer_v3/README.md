@@ -167,6 +167,13 @@ copy of the policy that is refreshed between batches. Environments that expose a
 boolean `env.milestone_key` vector have its flags logged at the end of every
 episode under `env.milestone_names`.
 
+`optimization.collection_warmup_seconds` delays the first update so the
+environments and the inference server run unthrottled for that long, which
+measures their throughput before the train ratio couples collection to the
+learner; `collector.compile_policy=true` compiles the acting policy and traces
+it for the served batch sizes before collection starts, falling back to the
+eager policy if compilation fails.
+
 `optimization.max_time` stops a run after a wall-clock budget (with
 `collector.total_frames=-1` for an unbounded frame budget), and
 `logger.backend=wandb` mirrors every JSONL record to Weights & Biases
