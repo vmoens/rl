@@ -547,7 +547,9 @@ class DreamerV3ActorLoss(LossModule):
     following DreamerV3. This keeps the fixed entropy bonus ``eta``
     comparable across reward scales. The statistics live in a
     :class:`~torchrl.modules.PercentileValueNorm` submodule
-    (``self.retnorm``); ``return_low`` / ``return_high`` are exposed as
+    (``self.retnorm``); the loss output also reports ``actor_entropy``, the
+    discount-weighted policy entropy (zero when the entropy bonus is disabled),
+    and ``return_low`` / ``return_high`` are exposed as
     read-through views for logging.
 
     Reference: https://arxiv.org/abs/2301.04104
@@ -862,10 +864,13 @@ class DreamerV3ActorLoss(LossModule):
             entropy = _match_trailing_dim(entropy, discount)
             entropy = (discount * entropy).mean()
             actor_loss = actor_loss - self.entropy_bonus * entropy
+        else:
+            entropy = torch.zeros((), device=actor_loss.device)
 
         loss_tensordict = TensorDict(
             {
                 "loss_actor": actor_loss,
+                "actor_entropy": entropy.detach(),
                 "return_low": self.return_low.detach().clone(),
                 "return_high": self.return_high.detach().clone(),
                 "return_scale": return_scale.detach().clone(),

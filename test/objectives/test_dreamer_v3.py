@@ -642,6 +642,10 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         loss_td, fake_data = loss_module(tensordict.reshape(-1))
         assert "loss_actor" in loss_td.keys()
         assert loss_td["loss_actor"].ndim == 0 or loss_td["loss_actor"].numel() == 1
+        # The entropy bonus is on by default, so the (differential) entropy of
+        # the imagined policy is reported as a detached diagnostic.
+        assert loss_td["actor_entropy"].isfinite()
+        assert not loss_td["actor_entropy"].requires_grad
         loss_td["loss_actor"].backward()
         grad_total = sum(
             p.grad.pow(2).sum().item()

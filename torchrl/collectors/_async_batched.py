@@ -106,7 +106,15 @@ def _env_loop(
             cur_td.set(_ENV_IDX_KEY, env_id)
             if storing_device is not None:
                 cur_td = cur_td.to(storing_device)
-            result_queue.put(cur_td)
+            # A bounded queue blocks here while the consumer lags; poll so a
+            # shutdown request is still honored.
+            while True:
+                try:
+                    result_queue.put(cur_td, timeout=1.0)
+                    break
+                except queue.Full:
+                    if shutdown_event.is_set():
+                        return
             if shutdown_event.is_set():
                 break
             action_td = client(next_obs)
@@ -230,6 +238,13 @@ class AsyncBatchedCollector(BaseCollector):
         create_env_kwargs (dict or list[dict], optional): keyword arguments
             forwarded to each environment factory.  A single dict is broadcast
             to all factories.
+        result_queue_maxsize (int, optional): capacity of the queue that holds
+            collected transitions until the next batch is drained.  When it is
+            full, the coordinator threads block after stepping their env, so
+            environments stop producing frames while the consumer (typically a
+            learner) lags behind.  ``None`` (default) keeps the queue
+            unbounded: environments then run at full speed regardless of how
+            fast batches are consumed.
 
     Examples:
         >>> from torchrl.collectors import AsyncBatchedCollector
@@ -281,9 +296,16 @@ class AsyncBatchedCollector(BaseCollector):
         device_config: InferenceDeviceConfig | None = None,
         policy_version: int = 0,
         policy_version_key: NestedKey | None = "policy_version",
+        result_queue_maxsize: int | None = None,
     ):
         if policy is not None and policy_factory is not None:
             raise TypeError("policy and policy_factory are mutually exclusive.")
+        if result_queue_maxsize is not None and result_queue_maxsize < 1:
+            raise ValueError(
+                "result_queue_maxsize must be a positive integer or None, got "
+                f"{result_queue_maxsize}."
+            )
+        self._result_queue_maxsize = result_queue_maxsize
         if policy is None and policy_factory is None:
             raise TypeError("One of policy or policy_factory must be provided.")
         if server_config is not None and any(
@@ -455,7 +477,7 @@ class AsyncBatchedCollector(BaseCollector):
             self._server.start()
 
         # Start per-env coordinator threads
-        self._result_queue = queue.Queue()
+        self._result_queue = queue.Queue(maxsize=self._result_queue_maxsize or 0)
         self._shutdown_event = threading.Event()
 
         self._workers = []

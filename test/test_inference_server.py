@@ -2224,6 +2224,30 @@ class TestAsyncBatchedCollector:
         assert total_collected >= total_frames
         assert stats["requests"] > 0
 
+    def test_bounded_result_queue(self):
+        """A bounded result queue throttles the envs but loses no frame."""
+        num_envs = 3
+        total_frames = 60
+        collector = AsyncBatchedCollector(
+            create_env_fn=[_counting_env_factory] * num_envs,
+            policy=_make_counting_policy(),
+            frames_per_batch=20,
+            total_frames=total_frames,
+            max_batch_size=num_envs,
+            env_backend="threading",
+            result_queue_maxsize=4,
+        )
+        total_collected = sum(batch.numel() for batch in collector)
+        collector.shutdown()
+        assert total_collected >= total_frames
+        with pytest.raises(ValueError, match="result_queue_maxsize"):
+            AsyncBatchedCollector(
+                create_env_fn=[_counting_env_factory],
+                policy=_make_counting_policy(),
+                frames_per_batch=1,
+                result_queue_maxsize=0,
+            )
+
     def test_policy_factory(self):
         """policy_factory is called to create the policy."""
         num_envs = 2
