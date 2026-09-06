@@ -21,6 +21,7 @@ Usage::
 from __future__ import annotations
 
 import copy
+import importlib
 from functools import partial
 from pathlib import Path
 from typing import NamedTuple
@@ -678,6 +679,11 @@ class _RunLogger:
                 "mode": cfg.logger.mode,
                 "config": OmegaConf.to_container(cfg, resolve=True),
             }
+            if cfg.logger.get("base_url", None):
+                # An explicit server wins over WANDB_BASE_URL, which imported
+                # libraries may have redirected to their own instance.
+                wandb = importlib.import_module("wandb")
+                wandb_kwargs["settings"] = wandb.Settings(base_url=cfg.logger.base_url)
             self.wandb = WandbLogger(
                 exp_name=cfg.logger.exp_name or f"dreamer_v3_{cfg.env.name}",
                 project=cfg.logger.project,

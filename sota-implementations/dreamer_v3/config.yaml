@@ -120,6 +120,8 @@ logger:
   backend: null
   project: torchrl-dreamer-v3
   entity: null
+  # W&B server; null follows WANDB_BASE_URL (which imported libraries may change).
+  base_url: null
   exp_name: null
   group: null
   tags: []

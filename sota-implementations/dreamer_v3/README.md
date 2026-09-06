@@ -164,6 +164,7 @@ episode under `env.milestone_names`.
 `optimization.max_time` stops a run after a wall-clock budget (with
 `collector.total_frames=-1` for an unbounded frame budget), and
 `logger.backend=wandb` mirrors every JSONL record to Weights & Biases
-(`logger.project`, `logger.entity`, `logger.exp_name`), including the collection
+(`logger.project`, `logger.entity`, `logger.exp_name`, and `logger.base_url` to
+pin the server when an imported library redirects `WANDB_BASE_URL`), including the collection
 rates, the inference-server statistics and the learner timings that the `train`
 records carry.
