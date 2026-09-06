@@ -5,12 +5,13 @@
 """The DreamerV3 networks, acting policy, optimizer and builders."""
 from __future__ import annotations
 
+import importlib
 import importlib.util
 from collections.abc import Callable, Iterable
 
 import torch
 from dreamer_v3_utils import latent_state_dim, POLICY_RNG_STREAM, stream_seed
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDictBase
 from tensordict.nn import (
     InteractionType,
@@ -20,7 +21,7 @@ from tensordict.nn import (
     TensorDictModuleBase,
     TensorDictSequential,
 )
-from tensordict.utils import NestedKey
+from tensordict.utils import NestedKey, unravel_key
 
 from torchrl.data import Unbounded
 from torchrl.envs import EnvBase, StepCounter, TransformedEnv
@@ -33,8 +34,16 @@ from torchrl.envs.transforms import (
     InitTracker,
     TensorDictPrimer,
 )
-from torchrl.modules import DreamerV3MLP, SymExpTwoHot, WorldModelWrapper
+from torchrl.modules import (
+    DreamerV3ImageDecoder,
+    DreamerV3ImageEncoder,
+    DreamerV3MLP,
+    SymExpTwoHot,
+    WorldModelWrapper,
+)
 from torchrl.modules.distributions.continuous import IndependentNormal
+from torchrl.modules.distributions.discrete import OneHotCategorical
+from torchrl.modules.models.model_based import _unimix_probs
 from torchrl.modules.models.model_based_v3 import (
     _dreamer_v3_init,
     RSSMPosteriorV3,
@@ -52,6 +61,29 @@ def _to_float(value: torch.Tensor) -> torch.Tensor:
 
 def _cast_float(key: NestedKey) -> TensorDictModule:
     return TensorDictModule(_to_float, in_keys=[key], out_keys=[key])
+
+
+def _strip_next(key: NestedKey) -> NestedKey:
+    """Map a ``("next", ...)`` key onto the matching root key."""
+    key = unravel_key(key)
+    if isinstance(key, tuple) and key[0] == "next":
+        return key[1] if len(key) == 2 else key[1:]
+    return key
+
+
+class _Concat(torch.nn.Module):
+    def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
+        return torch.cat(inputs, -1)
+
+
+def vector_key(cfg: DictConfig) -> str | None:
+    """The flat vector observation key, ``None`` when the env has none."""
+    return cfg.env.get("vector_key", "observation")
+
+
+def pixels_key(cfg: DictConfig) -> str | None:
+    """The image observation key, ``None`` when the env has none."""
+    return cfg.env.get("pixels_key", None)
 
 
 # --- Networks and the acting policy ---
@@ -121,6 +153,31 @@ class _DreamerV3Actor(torch.nn.Module):
         std = (self.max_std - self.min_std) * torch.sigmoid(std + 2) + self.min_std
         # The Normal parameters stay FP32, also under BF16 autocast.
         return mean.float(), std.float()
+
+
+class _DreamerV3DiscreteActor(torch.nn.Module):
+    """Categorical actor with the uniform mixture of the reference implementation."""
+
+    def __init__(self, cfg: DictConfig, action_dim: int):
+        super().__init__()
+        state_dim = latent_state_dim(cfg)
+        self.backbone = DreamerV3MLP(
+            state_dim + cfg.networks.rnn_hidden_dim,
+            None,
+            depth=cfg.networks.actor_layers,
+            num_cells=cfg.networks.hidden_dim,
+            norm_eps=cfg.networks.norm_eps,
+        )
+        self.logits_head = torch.nn.Linear(cfg.networks.hidden_dim, action_dim)
+        self.logits_head.apply(_dreamer_v3_init)
+        with torch.no_grad():
+            self.logits_head.weight.mul_(0.01)
+        self.unimix = cfg.networks.unimix
+
+    def forward(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
+        hidden = self.backbone(belief, state)
+        logits = self.logits_head(hidden).float()
+        return torch.log(_unimix_probs(logits, self.unimix))
 
 
 class _DreamerV3PolicyFilter(torch.nn.Module):
@@ -384,9 +441,41 @@ class DreamerV3Optimizer(torch.optim.Optimizer):
 # --- Builders ---
 
 
-def make_env(cfg: DictConfig, seed: int | None = 0) -> TransformedEnv:
+def _import_factory(path: str) -> Callable[..., EnvBase]:
+    module_name, separator, attribute = path.partition(":")
+    if not separator or not module_name or not attribute:
+        raise ValueError(
+            "env.factory must be an import path of the form "
+            f"'package.module:function', got {path!r}."
+        )
+    return getattr(importlib.import_module(module_name), attribute)
+
+
+def make_env(
+    cfg: DictConfig, seed: int | None = 0, env_index: int = 0
+) -> TransformedEnv:
+    """Build one real environment.
+
+    ``env_index`` identifies the environment among the ``collector.num_envs``
+    parallel copies; the ``custom`` backend forwards it to the factory.
+    """
     if cfg.env.backend == "gym":
         base_env = GymEnv(cfg.env.name, device="cpu")
+    elif cfg.env.backend == "custom":
+        if not cfg.env.get("factory", None):
+            raise ValueError("env.backend='custom' requires env.factory.")
+        factory_kwargs = cfg.env.get("factory_kwargs", None)
+        factory_kwargs = (
+            OmegaConf.to_container(factory_kwargs, resolve=True)
+            if factory_kwargs
+            else {}
+        )
+        base_env = _import_factory(cfg.env.factory)(
+            seed=seed if cfg.env.use_seed else None,
+            env_index=env_index,
+            num_envs=cfg.collector.num_envs,
+            **factory_kwargs,
+        )
     elif cfg.env.backend == "dm_control":
         if not _has_dm_control:
             raise ImportError(
@@ -425,11 +514,15 @@ def make_env(cfg: DictConfig, seed: int | None = 0) -> TransformedEnv:
 
 
 def make_primed_env(
-    cfg: DictConfig, seed: int | None, state_dim: int, action_dim: int
+    cfg: DictConfig,
+    seed: int | None,
+    state_dim: int,
+    action_dim: int,
+    env_index: int = 0,
 ) -> TransformedEnv:
     """Build an environment primed with latent, belief and previous action."""
     return TransformedEnv(
-        make_env(cfg, seed),
+        make_env(cfg, seed, env_index=env_index),
         TensorDictPrimer(
             random=False,
             default_value=0,
@@ -441,30 +534,89 @@ def make_primed_env(
 
 
 def build_world_model(
-    *, cfg: DictConfig, obs_dim: int, action_dim: int
+    *,
+    cfg: DictConfig,
+    obs_dim: int,
+    action_dim: int,
+    pixels_shape: tuple[int, int, int] | None = None,
 ) -> tuple[TensorDictSequential, RSSMPriorV3, DreamerV3MLP, SymExpTwoHot, DreamerV3MLP]:
-    """Build the world model: encoder, RSSM rollout, decoder and two heads."""
-    state_dim = latent_state_dim(cfg)
+    """Build the world model: encoder, RSSM rollout, decoder and two heads.
 
-    encoder = TensorDictSequential(
-        TensorDictModule(
-            symlog,
-            in_keys=[("next", "observation")],
-            out_keys=[("next", "symlog_observation")],
-        ),
-        TensorDictModule(
-            DreamerV3MLP(
-                in_features=obs_dim,
-                # The output is the last hidden activation, with no projection.
-                out_features=None,
-                depth=cfg.networks.encoder_layers,
-                num_cells=cfg.networks.hidden_dim,
-                norm_eps=cfg.networks.norm_eps,
-            ),
-            in_keys=[("next", "symlog_observation")],
-            out_keys=[("next", "encoded_latents")],
-        ),
-    )
+    ``obs_dim`` is the size of the flat vector observation stored under
+    ``cfg.env.vector_key``; ``0`` disables the vector path. ``pixels_shape`` is
+    the ``(C, H, W)`` shape of the image observation stored under
+    ``cfg.env.pixels_key``; ``None`` disables the image path. The decoded
+    vector is written to ``("next", "reco_pixels")`` without an image, which
+    keeps the vector-only keys unchanged, and to ``("next", "reco_<vector_key>")``
+    next to the decoded image otherwise.
+    """
+    state_dim = latent_state_dim(cfg)
+    vector = vector_key(cfg) if obs_dim else None
+    pixels = (pixels_key(cfg) or "pixels") if pixels_shape is not None else None
+    if vector is None and pixels is None:
+        raise ValueError(
+            "The world model needs a vector observation, an image observation, "
+            "or both."
+        )
+
+    encoder_modules = []
+    embed_dim = 0
+    if vector is not None:
+        vector_embedding = (
+            "next",
+            "encoded_vector" if pixels is not None else "encoded_latents",
+        )
+        encoder_modules.extend(
+            [
+                TensorDictModule(
+                    symlog,
+                    in_keys=[("next", vector)],
+                    out_keys=[("next", f"symlog_{vector}")],
+                ),
+                TensorDictModule(
+                    DreamerV3MLP(
+                        in_features=obs_dim,
+                        # The output is the last hidden activation, with no projection.
+                        out_features=None,
+                        depth=cfg.networks.encoder_layers,
+                        num_cells=cfg.networks.hidden_dim,
+                        norm_eps=cfg.networks.norm_eps,
+                    ),
+                    in_keys=[("next", f"symlog_{vector}")],
+                    out_keys=[vector_embedding],
+                ),
+            ]
+        )
+        embed_dim += cfg.networks.hidden_dim
+    if pixels is not None:
+        image_encoder = DreamerV3ImageEncoder(
+            in_channels=pixels_shape[0],
+            depth=cfg.networks.image_depth,
+            mults=tuple(cfg.networks.image_mults),
+            kernel_size=cfg.networks.image_kernel_size,
+            norm_eps=cfg.networks.norm_eps,
+        )
+        image_embedding = (
+            "next",
+            "encoded_pixels" if vector is not None else "encoded_latents",
+        )
+        encoder_modules.append(
+            TensorDictModule(
+                image_encoder,
+                in_keys=[("next", pixels)],
+                out_keys=[image_embedding],
+            )
+        )
+        embed_dim += image_encoder.output_features(pixels_shape)
+    if vector is not None and pixels is not None:
+        encoder_modules.append(
+            TensorDictModule(
+                _Concat(),
+                in_keys=[("next", "encoded_pixels"), ("next", "encoded_vector")],
+                out_keys=[("next", "encoded_latents")],
+            )
+        )
+    encoder = TensorDictSequential(*encoder_modules)
 
     prior_net = RSSMPriorV3(
         action_shape=torch.Size([action_dim]),
@@ -495,7 +647,7 @@ def build_world_model(
         num_categoricals=cfg.networks.num_categoricals,
         num_classes=cfg.networks.num_classes,
         rnn_hidden_dim=cfg.networks.rnn_hidden_dim,
-        obs_embed_dim=cfg.networks.hidden_dim,
+        obs_embed_dim=embed_dim,
         unimix=cfg.networks.unimix,
         use_rms_norm=True,
         num_layers=cfg.networks.posterior_layers,
@@ -520,31 +672,58 @@ def build_world_model(
             ),
         )
 
-    decoder_event_dims = tuple(cfg.networks.decoder_event_dims or (obs_dim,))
-    if sum(decoder_event_dims) != obs_dim:
-        raise ValueError(
-            "Decoder event dimensions must sum to the flattened observation "
-            f"size, got {decoder_event_dims} for {obs_dim}."
+    decoder_modules = []
+    if vector is not None:
+        decoder_event_dims = tuple(cfg.networks.decoder_event_dims or (obs_dim,))
+        if sum(decoder_event_dims) != obs_dim:
+            raise ValueError(
+                "Decoder event dimensions must sum to the flattened observation "
+                f"size, got {decoder_event_dims} for {obs_dim}."
+            )
+        reco_symlog_key = ("next", f"reco_symlog_{vector}")
+        reco_key = ("next", "reco_pixels" if pixels is None else f"reco_{vector}")
+        # One head for each event: AGC clips each head separately, thus a merged
+        # head trains differently. The FP32 symexp keeps the loss symlog exact.
+        decoder_modules.extend(
+            [
+                TensorDictModule(
+                    _DreamerV3Decoder(
+                        cfg,
+                        state_dim + cfg.networks.rnn_hidden_dim,
+                        decoder_event_dims,
+                    ),
+                    in_keys=[("next", "state"), ("next", "belief")],
+                    out_keys=[reco_symlog_key],
+                ),
+                _cast_float(reco_symlog_key),
+                TensorDictModule(
+                    symexp, in_keys=[reco_symlog_key], out_keys=[reco_key]
+                ),
+            ]
         )
-    # One head for each event: AGC clips each head separately, thus a merged
-    # head trains differently. The FP32 symexp keeps the loss symlog exact.
-    decoder = TensorDictSequential(
-        TensorDictModule(
-            _DreamerV3Decoder(
-                cfg,
-                state_dim + cfg.networks.rnn_hidden_dim,
-                decoder_event_dims,
-            ),
-            in_keys=[("next", "state"), ("next", "belief")],
-            out_keys=[("next", "reco_symlog_observation")],
-        ),
-        _cast_float(("next", "reco_symlog_observation")),
-        TensorDictModule(
-            symexp,
-            in_keys=[("next", "reco_symlog_observation")],
-            out_keys=[("next", "reco_pixels")],
-        ),
-    )
+    if pixels is not None:
+        image_decoder = DreamerV3ImageDecoder(
+            in_features=state_dim + cfg.networks.rnn_hidden_dim,
+            image_shape=tuple(pixels_shape),
+            depth=cfg.networks.image_depth,
+            mults=tuple(cfg.networks.image_mults),
+            kernel_size=cfg.networks.image_kernel_size,
+            num_blocks=cfg.networks.image_decoder_blocks,
+            norm_eps=cfg.networks.norm_eps,
+        )
+        # The decoded image lives in the [0, 1] range of pixels / 255 and is
+        # trained with a plain squared error, like the reference.
+        decoder_modules.extend(
+            [
+                TensorDictModule(
+                    image_decoder,
+                    in_keys=[("next", "state"), ("next", "belief")],
+                    out_keys=[("next", "reco_pixels")],
+                ),
+                _cast_float(("next", "reco_pixels")),
+            ]
+        )
+    decoder = TensorDictSequential(*decoder_modules)
 
     reward_net = DreamerV3MLP(
         in_features=state_dim + cfg.networks.rnn_hidden_dim,
@@ -646,8 +825,25 @@ def build_continuation_model(*, continuation_net: DreamerV3MLP) -> TensorDictSeq
 
 
 def build_actor(
-    *, cfg: DictConfig, action_dim: int
+    *, cfg: DictConfig, action_dim: int, discrete: bool = False
 ) -> ProbabilisticTensorDictSequential:
+    """Build the actor; ``discrete`` selects a one-hot categorical policy."""
+    if discrete:
+        return ProbabilisticTensorDictSequential(
+            TensorDictModule(
+                _DreamerV3DiscreteActor(cfg, action_dim),
+                in_keys=["state", "belief"],
+                out_keys=["logits"],
+            ),
+            ProbabilisticTensorDictModule(
+                in_keys=["logits"],
+                out_keys=["action"],
+                default_interaction_type=InteractionType.RANDOM,
+                distribution_class=OneHotCategorical,
+                return_log_prob=True,
+                log_prob_key="action_log_prob",
+            ),
+        )
     actor_mlp = _DreamerV3Actor(cfg, action_dim)
     actor_model = ProbabilisticTensorDictSequential(
         TensorDictModule(
@@ -677,21 +873,21 @@ def build_real_world_actor(
 
     The policy shares the trained encoder, prior, posterior and actor.
     """
-    encoder_net = world_model[0][1].module
     rssm_rollout = world_model[1]
     prior_net = rssm_rollout.rssm_prior.module
     posterior_net = rssm_rollout.rssm_posterior.module
+    # The acting encoder shares the world-model modules and reads the current
+    # observation instead of the next one.
+    acting_encoder = [
+        TensorDictModule(
+            module.module,
+            in_keys=[_strip_next(key) for key in module.in_keys],
+            out_keys=[_strip_next(key) for key in module.out_keys],
+        )
+        for module in world_model[0].module
+    ]
     policy = TensorDictSequential(
-        TensorDictModule(
-            symlog,
-            in_keys=["observation"],
-            out_keys=["symlog_observation"],
-        ),
-        TensorDictModule(
-            encoder_net,
-            in_keys=["symlog_observation"],
-            out_keys=["encoded_latents"],
-        ),
+        *acting_encoder,
         TensorDictModule(
             _DreamerV3PolicyFilter(prior_net, posterior_net),
             in_keys=[
