@@ -118,6 +118,17 @@ optimization:
   lmbda: 0.95
   # Wall-clock budget in seconds; null runs to collector.total_frames.
   max_time: null
+  # Checkpoint every N learner updates and once more on graceful shutdown.
+  # A relative directory lives below Hydra's run directory; null disables saves.
+  checkpoint_dir: checkpoints
+  checkpoint_every: 1000
+  checkpoint_keep_last: 2
+  # Replay tensors can dominate checkpoint size. When false, a resumed run
+  # refills replay while preserving model, optimizer, RNG and run counters.
+  checkpoint_include_replay: false
+  # A checkpoint or rotation directory. null discovers the newest checkpoint
+  # in checkpoint_dir when one exists.
+  resume_from: null
 
 logger:
   train_every: 200
