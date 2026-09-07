@@ -311,6 +311,13 @@ class _LearnerUpdate:
         sample: TensorDictBase,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         result = self.train_step(sample)
+        if all(parameter.grad is None for parameter in self.parameters):
+            raise RuntimeError(
+                "The training step left no gradient on any parameter, so the "
+                "optimizer step would be a no-op. With a CUDA-graphed step the "
+                "gradients live in the tensors captured with the graph; they must "
+                "not be set to None between steps."
+            )
         self.optimizer.step()
         self.value_target_updater.step()
         return result
@@ -388,7 +395,10 @@ def _warm_up_learner(
         sample = _fake_learner_sample(cfg, layout, state_dim, action_dim).to(device)
         for _ in range(calls):
             learner_update.train_step(sample)
-    learner_update.optimizer.zero_grad(set_to_none=True)
+    # A captured graph keeps writing its gradients into the tensors allocated
+    # during capture; setting them to None here would hide every later
+    # gradient from the optimizer. Zero them in place instead.
+    learner_update.optimizer.zero_grad(set_to_none=False)
     modules.load_state_dict(state)
 
 

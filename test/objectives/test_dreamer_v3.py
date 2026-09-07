@@ -1261,6 +1261,103 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
             if key.startswith(target_prefix)
         )
 
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    @pytest.mark.skipif(not _has_hoptorch, reason="requires hoptorch")
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf and _has_gym),
+        reason="requires hydra, omegaconf, and gym",
+    )
+    def test_dreamer_v3_warm_up_keeps_cuda_graph_learner_trainable(
+        self, device, monkeypatch
+    ):
+        """The learner must keep updating its parameters after the pre-collection warm-up.
+
+        The captured graph writes gradients into the tensors allocated at
+        capture time; a warm-up that set them to None left every later
+        optimizer step without gradients.
+        """
+        from omegaconf import OmegaConf
+
+        device = torch.device(device)
+        if device.type != "cuda":
+            pytest.skip("CUDA graph test only runs for the CUDA parametrization")
+
+        repo_root = Path(__file__).parents[2]
+        example_dir = repo_root / "sota-implementations/dreamer_v3"
+        monkeypatch.syspath_prepend(str(example_dir))
+        example = runpy.run_path(
+            example_dir / "train.py", run_name="dreamer_v3_warm_up_test"
+        )
+        cfg = OmegaConf.load(example_dir / "config.yaml")
+        cfg.networks.rnn_hidden_dim = 8
+        cfg.networks.num_categoricals = 2
+        cfg.networks.num_classes = 2
+        cfg.networks.num_blocks = 2
+        cfg.networks.hidden_dim = 8
+        cfg.networks.num_reward_bins = 16
+        cfg.networks.num_value_bins = 16
+        cfg.networks.encoder_layers = 1
+        cfg.networks.decoder_layers = 1
+        cfg.networks.reward_layers = 1
+        cfg.networks.actor_layers = 1
+        cfg.networks.value_layers = 1
+        cfg.replay_buffer.batch_size = 2
+        cfg.replay_buffer.seq_len = 3
+        cfg.optimization.imagination_horizon = 3
+        cfg.optimization.continuation_horizon = 3
+        cfg.optimization.warmup_steps = 0
+        cfg.optimization.mixed_precision = True
+        cfg.optimization.compile_rssm = "scan"
+        cfg.optimization.rssm_scan_unroll = 1
+        cfg.optimization.cudagraph_train_step = True
+
+        state_dim = 4
+        torch.manual_seed(0)
+        learner = example["_build_learner"](cfg, device, 3, 1)
+        modules = nn.ModuleList(
+            [learner.model_loss, learner.actor_loss, learner.value_loss]
+        )
+        update = example["_LearnerUpdate"](cfg, device, learner, cudagraph_warmup=2)
+        layout = example["ObservationLayout"]("observation", 3, None, None)
+        before = {
+            key: value.detach().clone() for key, value in modules.state_dict().items()
+        }
+        example["_warm_up_learner"](cfg, device, learner, update, layout, state_dim, 1)
+        # The warm-up restores the parameters and never steps the optimizer.
+        torch.testing.assert_close(modules.state_dict(), before)
+
+        torch.manual_seed(1)
+        sample = TensorDict(
+            {
+                "state": torch.zeros(2, 3, state_dim, device=device),
+                "belief": torch.zeros(2, 3, 8, device=device),
+                "action": torch.randn(2, 3, 1, device=device),
+                "is_init": torch.zeros(2, 3, 1, dtype=torch.bool, device=device),
+                "next": {
+                    "observation": torch.randn(2, 3, 3, device=device),
+                    "reward": torch.randn(2, 3, 1, device=device),
+                    "done": torch.zeros(2, 3, 1, dtype=torch.bool, device=device),
+                    "terminated": torch.zeros(2, 3, 1, dtype=torch.bool, device=device),
+                },
+            },
+            [2, 3],
+            device=device,
+        )
+        update(sample)
+        parameters = {
+            name: parameter
+            for name, parameter in modules.named_parameters()
+            if parameter.requires_grad
+        }
+        assert any(parameter.grad is not None for parameter in parameters.values())
+        changed = [
+            name
+            for name, parameter in parameters.items()
+            if not torch.equal(parameter.detach(), before[name])
+        ]
+        assert changed, "one real update must move the trainable parameters"
+
     @pytest.mark.skipif(not _has_omegaconf, reason="requires omegaconf")
     def test_dreamer_v3_dmc_benchmark_aggregation(self, device, tmp_path):
         from omegaconf import OmegaConf
