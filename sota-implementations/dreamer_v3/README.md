@@ -181,3 +181,25 @@ eager policy if compilation fails.
 pin the server when an imported library redirects `WANDB_BASE_URL`), including the collection
 rates, the inference-server statistics and the learner timings that the `train`
 records carry.
+
+## Checkpoint and resume
+
+The trainer writes a final checkpoint on a normal, time-budget, interrupt, or
+termination-signal shutdown and writes periodic checkpoints every
+`optimization.checkpoint_every` learner updates. Checkpoints rotate below
+`optimization.checkpoint_dir`; set that directory to `null` to disable saves.
+On restart, `optimization.resume_from` accepts either one checkpoint or a
+checkpoint directory. When it is `null`, the newest checkpoint already in the
+configured checkpoint directory is used automatically.
+
+Learner and target parameters, optimizer state, return normalization, RNG
+streams, replay cursors, cumulative environment/action/update counters and
+elapsed time are restored. The cumulative environment-step counter remains the
+step axis for JSONL and W&B metrics. A resumed W&B logger uses the saved run ID
+with `resume="must"`.
+
+Replay tensors are excluded by default because they can dominate checkpoint
+size. Set `optimization.checkpoint_include_replay=true` to save and restore the
+synchronous replay buffer or every asynchronous per-environment replay buffer,
+including their sampler, writer and latent-context state. Without that option,
+the resumed learner keeps its progress while replay safely refills from empty.

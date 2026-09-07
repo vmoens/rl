@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import importlib
+import signal
 from functools import partial
 from pathlib import Path
 from typing import NamedTuple
@@ -76,6 +77,7 @@ from tensordict.nn import CudaGraphModule, TensorDictModuleBase
 
 from torchrl import timeit
 from torchrl._utils import get_available_device, logger as torchrl_logger
+from torchrl.checkpoint import Checkpoint, CheckpointRotation, GlobalRNGState
 from torchrl.collectors import AsyncBatchedCollector, Collector
 from torchrl.data import LazyTensorStorage, OneHot, ReplayBuffer, RoundRobinWriter
 from torchrl.envs import EnvBase, SerialEnv
@@ -152,6 +154,31 @@ class _Learner(NamedTuple):
     value_target_updater: SoftUpdate
     optimizer: DreamerV3Optimizer
     real_world_actor: TensorDictModuleBase
+
+
+class _ElapsedTimer:
+    """Add elapsed time from an earlier process to a live timer."""
+
+    def __init__(self, timer, offset: float = 0.0):
+        self.timer = timer
+        self.offset = offset
+
+    def elapsed(self) -> float:
+        return self.offset + self.timer.elapsed()
+
+
+class _ShutdownRequest:
+    """Turn termination signals into a safe training-loop stop request."""
+
+    def __init__(self):
+        self.signal_number: int | None = None
+
+    @property
+    def requested(self) -> bool:
+        return self.signal_number is not None
+
+    def __call__(self, signal_number: int, _frame) -> None:
+        self.signal_number = signal_number
 
 
 class _LearnerUpdate:
@@ -567,7 +594,11 @@ def _build_collection(
     state_dim: int,
     action_dim: int,
     collector_action_frames: int,
-) -> tuple[Collector | AsyncBatchedCollector, DreamerV3BehaviorPolicySync | None]:
+) -> tuple[
+    Collector | AsyncBatchedCollector,
+    DreamerV3BehaviorPolicySync | None,
+    DreamerV3SeededPolicy | None,
+]:
     num_envs = cfg.collector.num_envs
     real_world_actor = learner.real_world_actor
     async_collection = cfg.collector.backend == "async"
@@ -683,7 +714,13 @@ def _build_collection(
     if cfg.optimization.separate_policy_rng:
         # The collector's construction-time policy call is not an action.
         collector_policy.reset_counter()
-    return collector, behavior_policy_sync
+    return (
+        collector,
+        behavior_policy_sync,
+        collector_policy
+        if isinstance(collector_policy, DreamerV3SeededPolicy)
+        else None,
+    )
 
 
 def _compile_policy(
@@ -791,14 +828,307 @@ def _build_replay(
     )
 
 
+def _replay_buffers(
+    replay: ReplayBuffer | MultiStreamReplay,
+) -> list[ReplayBuffer]:
+    if isinstance(replay, MultiStreamReplay):
+        return replay.buffers
+    return [replay]
+
+
+class _ReplayRNGState:
+    """Checkpoint the replay sampling streams independently of replay data."""
+
+    def __init__(self, replay: ReplayBuffer | MultiStreamReplay):
+        self.replay = replay
+
+    def state_dict(self) -> dict[str, object]:
+        state: dict[str, object] = {
+            "buffers": [
+                buffer._rng.get_state().clone()
+                for buffer in _replay_buffers(self.replay)
+            ]
+        }
+        if isinstance(self.replay, MultiStreamReplay):
+            state["stream"] = self.replay._rng.get_state().clone()
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        buffer_states = state_dict["buffers"]
+        buffers = _replay_buffers(self.replay)
+        if len(buffer_states) != len(buffers):
+            raise RuntimeError(
+                "The checkpoint replay stream count does not match the configured "
+                f"stream count ({len(buffer_states)} != {len(buffers)})."
+            )
+        for buffer, state in zip(buffers, buffer_states):
+            buffer._rng.set_state(state.cpu())
+        if isinstance(self.replay, MultiStreamReplay):
+            self.replay._rng.set_state(state_dict["stream"].cpu())
+
+
+class _ReplayAuxState:
+    """Checkpoint replay state that lives outside the replay buffers."""
+
+    def __init__(
+        self,
+        replay: ReplayBuffer | MultiStreamReplay,
+        replay_record_builder: DreamerV3ReplayRecordBuilder | None,
+        shifted_record_extender: DreamerV3ShiftedRecordExtender | None,
+    ):
+        self.replay = replay
+        self.replay_record_builder = replay_record_builder
+        self.shifted_record_extender = shifted_record_extender
+
+    def state_dict(self) -> dict[str, object]:
+        builders = (
+            self.replay.builders
+            if isinstance(self.replay, MultiStreamReplay)
+            else [self.replay_record_builder]
+        )
+        state: dict[str, object] = {
+            "builders_started": [builder._started for builder in builders],
+            "samplers": [
+                {
+                    "stream_lengths": (
+                        buffer.sampler._stream_lengths.clone()
+                        if buffer.sampler._stream_lengths is not None
+                        else None
+                    ),
+                    "online_queue": [
+                        start.clone() for start in buffer.sampler._online_queue
+                    ],
+                }
+                for buffer in _replay_buffers(self.replay)
+            ],
+        }
+        if self.shifted_record_extender is not None:
+            state["tail_index"] = self.shifted_record_extender._tail_index
+            state["tail_generation"] = self.shifted_record_extender._tail_generation
+        return state
+
+    def load_state_dict(self, state_dict: dict[str, object]) -> None:
+        builders = (
+            self.replay.builders
+            if isinstance(self.replay, MultiStreamReplay)
+            else [self.replay_record_builder]
+        )
+        builders_started = state_dict["builders_started"]
+        if len(builders_started) != len(builders):
+            raise RuntimeError(
+                "The checkpoint replay builder count does not match the configured "
+                f"builder count ({len(builders_started)} != {len(builders)})."
+            )
+        for builder, started in zip(builders, builders_started):
+            builder._started = bool(started)
+        sampler_states = state_dict["samplers"]
+        buffers = _replay_buffers(self.replay)
+        if len(sampler_states) != len(buffers):
+            raise RuntimeError(
+                "The checkpoint replay sampler count does not match the configured "
+                f"sampler count ({len(sampler_states)} != {len(buffers)})."
+            )
+        for buffer, sampler_state in zip(buffers, sampler_states):
+            stream_lengths = sampler_state["stream_lengths"]
+            buffer.sampler._stream_lengths = (
+                stream_lengths.clone() if stream_lengths is not None else None
+            )
+            buffer.sampler._online_queue = [
+                start.clone() for start in sampler_state["online_queue"]
+            ]
+        if self.shifted_record_extender is not None:
+            tail_index = state_dict.get("tail_index")
+            tail_generation = state_dict.get("tail_generation")
+            self.shifted_record_extender._tail_index = (
+                tail_index.clone() if tail_index is not None else None
+            )
+            self.shifted_record_extender._tail_generation = (
+                tail_generation.clone() if tail_generation is not None else None
+            )
+
+
+def _make_training_checkpoint(
+    cfg: DictConfig,
+    learner: _Learner,
+    replay: ReplayBuffer | MultiStreamReplay,
+    replay_record_builder: DreamerV3ReplayRecordBuilder | None,
+    shifted_record_extender: DreamerV3ShiftedRecordExtender | None,
+    run_state: dict[str, object],
+) -> Checkpoint:
+    checkpoint = Checkpoint(
+        learner=torch.nn.ModuleList(
+            [learner.model_loss, learner.actor_loss, learner.value_loss]
+        ),
+        optimizer=learner.optimizer,
+        target_updater=learner.value_target_updater,
+        replay_rng=_ReplayRNGState(replay),
+        replay_aux=_ReplayAuxState(
+            replay, replay_record_builder, shifted_record_extender
+        ),
+        run_state=run_state,
+        rng=GlobalRNGState(),
+        config=OmegaConf.to_container(cfg, resolve=True),
+    )
+    for index, buffer in enumerate(_replay_buffers(replay)):
+        checkpoint.register(f"replay_buffer_{index:04d}", buffer)
+    return checkpoint
+
+
+def _make_checkpoint_rotation(cfg: DictConfig) -> CheckpointRotation | None:
+    directory = cfg.optimization.get("checkpoint_dir", None)
+    if not directory:
+        return None
+    return CheckpointRotation(
+        Path(directory).resolve(),
+        keep_last=int(cfg.optimization.checkpoint_keep_last),
+    )
+
+
+def _resolve_resume_path(
+    cfg: DictConfig, rotation: CheckpointRotation | None
+) -> Path | None:
+    requested = cfg.optimization.get("resume_from", None)
+    if not requested:
+        return rotation.latest() if rotation is not None else None
+    candidate = Path(requested).expanduser().resolve()
+    if Checkpoint.is_checkpoint(candidate):
+        return candidate
+    if candidate.is_dir():
+        latest = CheckpointRotation(candidate, keep_last=1).latest()
+        if latest is not None:
+            return latest
+    raise FileNotFoundError(f"No checkpoint was found at {candidate}.")
+
+
+def _load_training_checkpoint(
+    checkpoint: Checkpoint,
+    path: Path,
+    *,
+    include_replay: bool,
+    device: torch.device,
+    replay_device: torch.device,
+) -> bool:
+    checkpoint.load(
+        path,
+        components={
+            "learner",
+            "optimizer",
+            "target_updater",
+            "replay_rng",
+            "run_state",
+        },
+        map_location=device,
+    )
+    registered_replay = {
+        name for name in checkpoint.components if name.startswith("replay_buffer_")
+    }
+    saved_components = set(Checkpoint.manifest(path)["components"])
+    replay_restored = bool(
+        include_replay
+        and registered_replay
+        and registered_replay.issubset(saved_components)
+        and "replay_aux" in saved_components
+    )
+    if replay_restored:
+        checkpoint.load(
+            path,
+            components=registered_replay | {"replay_aux"},
+            map_location=replay_device,
+        )
+    elif include_replay:
+        torchrl_logger.warning(
+            "The checkpoint has no complete replay payload; replay will restart "
+            "empty while learner counters continue from the checkpoint."
+        )
+    return replay_restored
+
+
+def _refresh_run_state(
+    run_state: dict[str, object],
+    replay: ReplayBuffer | MultiStreamReplay,
+    run_timer: _ElapsedTimer,
+    run_logger: _RunLogger,
+    collector_policy: DreamerV3SeededPolicy | None,
+    update_ratio: DreamerV3UpdateRatio | None,
+    *,
+    record_step: int,
+    action_step: int,
+    update_step: int,
+    next_eval: int,
+    next_train_log: int,
+    include_replay: bool,
+) -> None:
+    run_state.update(
+        {
+            "environment_steps": record_step,
+            "action_steps": action_step,
+            "updates": update_step,
+            "elapsed_seconds": run_timer.elapsed(),
+            "next_eval": next_eval,
+            "next_train_log": next_train_log,
+            "policy_rng_counter": (
+                collector_policy.counter if collector_policy is not None else None
+            ),
+            "update_ratio_previous": (
+                update_ratio._previous if update_ratio is not None else None
+            ),
+            "wandb_run_id": run_logger.run_id,
+            "replay_included": include_replay,
+            "replay_cursors": [
+                {
+                    "cursor": int(buffer.writer._cursor),
+                    "write_count": int(buffer.writer._write_count),
+                }
+                for buffer in _replay_buffers(replay)
+            ],
+        }
+    )
+
+
+def _save_training_checkpoint(
+    rotation: CheckpointRotation | None,
+    checkpoint: Checkpoint,
+    replay: ReplayBuffer | MultiStreamReplay,
+    replay_pipeline: DreamerV3ReplayPipeline,
+    *,
+    update_step: int,
+    include_replay: bool,
+) -> Path | None:
+    if rotation is None:
+        return None
+    # Make every latent refresh durable before the replay storage is copied.
+    replay_pipeline.apply_pending_context(replay)
+    components = set(checkpoint.components)
+    if not include_replay:
+        components.discard("replay_aux")
+        components.difference_update(
+            {name for name in components if name.startswith("replay_buffer_")}
+        )
+    path = rotation.save(checkpoint, step=update_step, components=components)
+    torchrl_logger.info("Saved DreamerV3 checkpoint to %s", path)
+    return path
+
+
 class _RunLogger:
     """Append run records to JSONL and mirror their scalars to Weights & Biases."""
 
-    def __init__(self, cfg: DictConfig, jsonl_path: Path | None):
+    def __init__(
+        self,
+        cfg: DictConfig,
+        jsonl_path: Path | None,
+        *,
+        resume_run_id: str | None = None,
+        resuming: bool = False,
+    ):
         self.jsonl_path = jsonl_path
         self.milestone_names = list(cfg.env.get("milestone_names", None) or [])
         self.wandb = None
         if cfg.logger.get("backend", None) == "wandb":
+            if resume_run_id is None and resuming:
+                raise ValueError(
+                    "The checkpoint does not contain a W&B run ID, so its run "
+                    "cannot be resumed."
+                )
             wandb_kwargs = {
                 "entity": cfg.logger.entity,
                 "group": cfg.logger.group,
@@ -806,6 +1136,8 @@ class _RunLogger:
                 "mode": cfg.logger.mode,
                 "config": OmegaConf.to_container(cfg, resolve=True),
             }
+            if resume_run_id is not None:
+                wandb_kwargs["resume"] = "must"
             if cfg.logger.get("base_url", None):
                 # An explicit server wins over WANDB_BASE_URL, which imported
                 # libraries may have redirected to their own instance.
@@ -813,6 +1145,7 @@ class _RunLogger:
                 wandb_kwargs["settings"] = wandb.Settings(base_url=cfg.logger.base_url)
             self.wandb = WandbLogger(
                 exp_name=cfg.logger.exp_name or f"dreamer_v3_{cfg.env.name}",
+                id=resume_run_id,
                 project=cfg.logger.project,
                 **{
                     key: value
@@ -823,6 +1156,12 @@ class _RunLogger:
             # Every curve is plotted against environment steps.
             self.wandb.experiment.define_metric("environment_steps")
             self.wandb.experiment.define_metric("*", step_metric="environment_steps")
+
+    @property
+    def run_id(self) -> str | None:
+        if self.wandb is None:
+            return None
+        return self.wandb.experiment.id
 
     def log(self, record: dict[str, object]) -> None:
         append_jsonl(self.jsonl_path, record)
@@ -1057,12 +1396,10 @@ def main(cfg: DictConfig):
     metrics_jsonl_path = (
         Path(cfg.logger.metrics_jsonl).resolve() if cfg.logger.metrics_jsonl else None
     )
-    if metrics_jsonl_path is not None:
-        metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-        metrics_jsonl_path.write_text("")
-    run_logger = _RunLogger(cfg, metrics_jsonl_path)
+    checkpoint_rotation = _make_checkpoint_rotation(cfg)
+    resume_path = _resolve_resume_path(cfg, checkpoint_rotation)
     timeit.reset()
-    run_timer = timeit("dreamer_v3/run").start()
+    process_timer = timeit("dreamer_v3/run").start()
 
     learner = _build_learner(
         cfg,
@@ -1098,9 +1435,6 @@ def main(cfg: DictConfig):
             warmup_timer.elapsed(),
         )
 
-    collector, behavior_policy_sync = _build_collection(
-        cfg, device, learner, state_dim, action_dim, collector_action_frames
-    )
     (
         replay,
         replay_sampler,
@@ -1109,10 +1443,80 @@ def main(cfg: DictConfig):
         replay_pipeline,
     ) = _build_replay(cfg, num_envs, replay_device, layout.observation_keys)
 
-    action_step = 0
     # Each worker sends a reset record before its first control transition.
-    record_step = num_envs if count_reset_records else 0
-    update_step = 0
+    initial_record_step = num_envs if count_reset_records else 0
+    run_state: dict[str, object] = {
+        "environment_steps": initial_record_step,
+        "action_steps": 0,
+        "updates": 0,
+        "elapsed_seconds": 0.0,
+        "next_eval": 0,
+        "next_train_log": 0,
+        "policy_rng_counter": None,
+        "update_ratio_previous": None,
+        "wandb_run_id": None,
+    }
+    checkpoint = _make_training_checkpoint(
+        cfg,
+        learner,
+        replay,
+        replay_record_builder,
+        shifted_record_extender,
+        run_state,
+    )
+    include_replay = bool(cfg.optimization.checkpoint_include_replay)
+    replay_restored = False
+    if resume_path is not None:
+        replay_restored = _load_training_checkpoint(
+            checkpoint,
+            resume_path,
+            include_replay=include_replay,
+            device=device,
+            replay_device=replay_device,
+        )
+        torchrl_logger.info("Resuming DreamerV3 from %s", resume_path)
+
+    record_step = int(run_state["environment_steps"])
+    action_step = int(run_state["action_steps"])
+    update_step = int(run_state["updates"])
+    next_eval = int(run_state["next_eval"])
+    next_train_log = int(run_state["next_train_log"])
+    run_timer = _ElapsedTimer(process_timer, float(run_state["elapsed_seconds"]))
+    remaining_action_frames = (
+        -1
+        if collector_action_frames < 0
+        else max(collector_action_frames - action_step, 0)
+    )
+    collector, behavior_policy_sync, collector_policy = _build_collection(
+        cfg, device, learner, state_dim, action_dim, remaining_action_frames
+    )
+    policy_rng_counter = run_state.get("policy_rng_counter")
+    if collector_policy is not None and policy_rng_counter is not None:
+        collector_policy.counter = int(policy_rng_counter)
+
+    if metrics_jsonl_path is not None:
+        metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        if resume_path is None:
+            metrics_jsonl_path.write_text("")
+    run_logger = _RunLogger(
+        cfg,
+        metrics_jsonl_path,
+        resume_run_id=run_state.get("wandb_run_id"),
+        resuming=resume_path is not None,
+    )
+
+    eval_env = (
+        make_primed_env(cfg, cfg.env.seed + 100, state_dim, action_dim)
+        if cfg.logger.eval_every
+        else None
+    )
+    if resume_path is not None:
+        # Setup may sample RNGs; restoring last makes the learner stream exact.
+        checkpoint.load(resume_path, components={"rng"}, map_location="cpu")
+    elif cfg.optimization.separate_policy_rng:
+        # Keep the learner draws in a range apart from the policy stream.
+        torch.manual_seed(stream_seed(cfg.env.seed, 0, LEARNER_RNG_STREAM))
+
     running_training_return = torch.zeros(num_envs)
     episode_tracker = (
         AsyncEpisodeTracker(num_envs, cfg.env.get("milestone_key", None))
@@ -1125,14 +1529,6 @@ def main(cfg: DictConfig):
     loss_window_sum = torch.zeros(len(UPDATE_METRICS), device=device)
     loss_window_updates = 0
     record_loss_history = plot_enabled(cfg)
-    next_eval = 0
-    next_train_log = 0
-
-    eval_env = (
-        make_primed_env(cfg, cfg.env.seed + 100, state_dim, action_dim)
-        if cfg.logger.eval_every
-        else None
-    )
 
     sequence_records = cfg.replay_buffer.seq_len + 1
     warmup = (
@@ -1150,18 +1546,33 @@ def main(cfg: DictConfig):
         if cfg.optimization.train_ratio is not None
         else None
     )
+    update_ratio_previous = run_state.get("update_ratio_previous")
+    if (
+        replay_restored
+        and update_ratio is not None
+        and update_ratio_previous is not None
+    ):
+        update_ratio._previous = float(update_ratio_previous)
     throughput = _ThroughputWindow(run_timer, records_per_update)
+    throughput.mark(record_step, action_step, update_step)
     max_time = cfg.optimization.max_time
     collection_warmup_seconds = (
         cfg.optimization.get("collection_warmup_seconds", 0) or 0
     )
     stop_reason = "frame_budget"
-
-    if cfg.optimization.separate_policy_rng:
-        # Keep the learner draws in a range apart from the policy stream.
-        torch.manual_seed(stream_seed(cfg.env.seed, 0, LEARNER_RNG_STREAM))
+    checkpoint_every = int(cfg.optimization.checkpoint_every or 0)
+    last_checkpoint_update = update_step
+    shutdown_request = _ShutdownRequest()
+    handled_signals = (signal.SIGINT, signal.SIGTERM)
+    previous_signal_handlers = {
+        signal_number: signal.signal(signal_number, shutdown_request)
+        for signal_number in handled_signals
+    }
 
     for data in collector:
+        if shutdown_request.requested:
+            stop_reason = f"signal_{shutdown_request.signal_number}"
+            break
         if max_time and run_timer.elapsed() >= max_time:
             stop_reason = "max_time"
             break
@@ -1311,6 +1722,65 @@ def main(cfg: DictConfig):
             history_eval.append(r)
             next_eval = record_step + cfg.logger.eval_every
 
+        if (
+            checkpoint_every > 0
+            and update_step - last_checkpoint_update >= checkpoint_every
+        ):
+            _refresh_run_state(
+                run_state,
+                replay,
+                run_timer,
+                run_logger,
+                collector_policy,
+                update_ratio,
+                record_step=record_step,
+                action_step=action_step,
+                update_step=update_step,
+                next_eval=next_eval,
+                next_train_log=next_train_log,
+                include_replay=include_replay,
+            )
+            _save_training_checkpoint(
+                checkpoint_rotation,
+                checkpoint,
+                replay,
+                replay_pipeline,
+                update_step=update_step,
+                include_replay=include_replay,
+            )
+            last_checkpoint_update = update_step
+
+        if shutdown_request.requested:
+            stop_reason = f"signal_{shutdown_request.signal_number}"
+            break
+        if max_time and run_timer.elapsed() >= max_time:
+            stop_reason = "max_time"
+            break
+
+    _refresh_run_state(
+        run_state,
+        replay,
+        run_timer,
+        run_logger,
+        collector_policy,
+        update_ratio,
+        record_step=record_step,
+        action_step=action_step,
+        update_step=update_step,
+        next_eval=next_eval,
+        next_train_log=next_train_log,
+        include_replay=include_replay,
+    )
+    _save_training_checkpoint(
+        checkpoint_rotation,
+        checkpoint,
+        replay,
+        replay_pipeline,
+        update_step=update_step,
+        include_replay=include_replay,
+    )
+    for signal_number, previous_handler in previous_signal_handlers.items():
+        signal.signal(signal_number, previous_handler)
     collector.shutdown()
     if cfg.logger.output_plot:
         save_run_plot(cfg, history_steps, history_eval, loss_history, UPDATE_METRICS)

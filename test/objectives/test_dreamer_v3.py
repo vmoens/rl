@@ -1126,6 +1126,250 @@ class TestDreamerV3(LossModuleTestBase):  # type: ignore[misc]
         continuation_model(reward_td)
         assert reward_td["continuation"].shape == (2, 1)
 
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf and _has_gym),
+        reason="requires hydra, omegaconf, and gym",
+    )
+    @pytest.mark.parametrize("collector_backend", ["sync", "async"])
+    @pytest.mark.parametrize("include_replay", [False, True])
+    def test_dreamer_v3_sota_checkpoint_restores_training(
+        self, device, monkeypatch, tmp_path, collector_backend, include_replay
+    ):
+        from omegaconf import OmegaConf
+
+        device = torch.device(device)
+        repo_root = Path(__file__).parents[2]
+        example_dir = repo_root / "sota-implementations/dreamer_v3"
+        monkeypatch.syspath_prepend(str(example_dir))
+        example = runpy.run_path(
+            example_dir / "train.py", run_name="dreamer_v3_checkpoint_test"
+        )
+        cfg = OmegaConf.load(example_dir / "config.yaml")
+        cfg.networks.rnn_hidden_dim = 8
+        cfg.networks.num_categoricals = 2
+        cfg.networks.num_classes = 2
+        cfg.networks.num_blocks = 2
+        cfg.networks.hidden_dim = 8
+        cfg.networks.num_reward_bins = 16
+        cfg.networks.num_value_bins = 16
+        cfg.networks.encoder_layers = 1
+        cfg.networks.decoder_layers = 1
+        cfg.networks.reward_layers = 1
+        cfg.networks.actor_layers = 1
+        cfg.networks.value_layers = 1
+        cfg.replay_buffer.buffer_size = 32
+        cfg.replay_buffer.batch_size = 2
+        cfg.replay_buffer.seq_len = 3
+        cfg.optimization.imagination_horizon = 3
+        cfg.optimization.continuation_horizon = 3
+        cfg.optimization.warmup_steps = 0
+        cfg.optimization.mixed_precision = False
+        cfg.optimization.compile_rssm = None
+        cfg.optimization.cudagraph_train_step = False
+        cfg.optimization.checkpoint_dir = str(tmp_path)
+        cfg.optimization.checkpoint_include_replay = include_replay
+        cfg.collector.backend = collector_backend
+        cfg.collector.num_envs = 2 if collector_backend == "async" else 1
+
+        state_dim = 4
+        sample = TensorDict(
+            {
+                "state": torch.zeros(2, 3, state_dim, device=device),
+                "belief": torch.zeros(2, 3, 8, device=device),
+                "action": torch.randn(2, 3, 1, device=device),
+                "is_init": torch.zeros(2, 3, 1, dtype=torch.bool, device=device),
+                "next": {
+                    "observation": torch.randn(2, 3, 3, device=device),
+                    "reward": torch.randn(2, 3, 1, device=device),
+                    "done": torch.zeros(2, 3, 1, dtype=torch.bool, device=device),
+                    "terminated": torch.zeros(2, 3, 1, dtype=torch.bool, device=device),
+                },
+            },
+            [2, 3],
+            device=device,
+        )
+
+        torch.manual_seed(0)
+        learner = example["_build_learner"](cfg, device, 3, 1)
+        learner_update = example["_LearnerUpdate"](cfg, device, learner)
+        for seed in (10, 11):
+            torch.manual_seed(seed)
+            learner_update(sample.clone())
+
+        replay, sampler, builder, shifted, pipeline = example["_build_replay"](
+            cfg,
+            cfg.collector.num_envs,
+            torch.device("cpu"),
+            (("next", "observation"),),
+        )
+        for stream, buffer in enumerate(example["_replay_buffers"](replay)):
+            records = TensorDict(
+                {"x": torch.arange(12).unsqueeze(-1) + 100 * stream}, [12]
+            )
+            indices = buffer.extend(records)
+            buffer.sampler.observe_extend(indices, buffer.storage)
+        if collector_backend == "async":
+            for replay_builder in replay.builders:
+                replay_builder._started = True
+        else:
+            builder._started = True
+        run_state = {}
+        checkpoint = example["_make_training_checkpoint"](
+            cfg, learner, replay, builder, shifted, run_state
+        )
+        run_logger = example["_RunLogger"](cfg, None)
+        policy = example["DreamerV3SeededPolicy"](learner.real_world_actor, 0)
+        policy.counter = 17
+        update_ratio = example["DreamerV3UpdateRatio"](0.5)
+        update_ratio._previous = 41.5
+
+        class _Timer:
+            def elapsed(self):
+                return 2.5
+
+        run_timer = example["_ElapsedTimer"](_Timer(), 4.0)
+        example["_refresh_run_state"](
+            run_state,
+            replay,
+            run_timer,
+            run_logger,
+            policy,
+            update_ratio,
+            record_step=48,
+            action_step=47,
+            update_step=2,
+            next_eval=60,
+            next_train_log=64,
+            include_replay=include_replay,
+        )
+        checkpoint_path = example["_save_training_checkpoint"](
+            example["_make_checkpoint_rotation"](cfg),
+            checkpoint,
+            replay,
+            pipeline,
+            update_step=2,
+            include_replay=include_replay,
+        )
+        saved_global_rng = torch.random.get_rng_state().clone()
+
+        torch.manual_seed(999)
+        restored_learner = example["_build_learner"](cfg, device, 3, 1)
+        restored_replay, _, restored_builder, restored_shifted, _ = example[
+            "_build_replay"
+        ](
+            cfg,
+            cfg.collector.num_envs,
+            torch.device("cpu"),
+            (("next", "observation"),),
+        )
+        restored_run_state = {}
+        restored_checkpoint = example["_make_training_checkpoint"](
+            cfg,
+            restored_learner,
+            restored_replay,
+            restored_builder,
+            restored_shifted,
+            restored_run_state,
+        )
+        assert (
+            example["_load_training_checkpoint"](
+                restored_checkpoint,
+                checkpoint_path,
+                include_replay=include_replay,
+                device=device,
+                replay_device=torch.device("cpu"),
+            )
+            is include_replay
+        )
+        restored_checkpoint.load(
+            checkpoint_path, components={"rng"}, map_location="cpu"
+        )
+
+        torch.testing.assert_close(
+            restored_checkpoint.components["learner"].state_dict(),
+            checkpoint.components["learner"].state_dict(),
+        )
+        torch.testing.assert_close(
+            restored_learner.optimizer.state_dict(), learner.optimizer.state_dict()
+        )
+        assert restored_learner.value_target_updater.state_dict() == (
+            learner.value_target_updater.state_dict()
+        )
+        assert restored_run_state == run_state
+        assert len(restored_replay) == (len(replay) if include_replay else 0)
+        if collector_backend == "async":
+            assert all(
+                builder._started is include_replay
+                for builder in restored_replay.builders
+            )
+            assert torch.equal(
+                restored_replay._rng.get_state(), replay._rng.get_state()
+            )
+        else:
+            assert restored_builder._started is include_replay
+        for restored_buffer, buffer in zip(
+            example["_replay_buffers"](restored_replay),
+            example["_replay_buffers"](replay),
+        ):
+            assert torch.equal(
+                restored_buffer._rng.get_state(), buffer._rng.get_state()
+            )
+            if not include_replay:
+                continue
+            assert restored_buffer.writer._cursor == buffer.writer._cursor
+            assert torch.equal(
+                restored_buffer.sampler._stream_lengths,
+                buffer.sampler._stream_lengths,
+            )
+            assert len(restored_buffer.sampler._online_queue) == len(
+                buffer.sampler._online_queue
+            )
+            assert all(
+                torch.equal(actual, expected)
+                for actual, expected in zip(
+                    restored_buffer.sampler._online_queue,
+                    buffer.sampler._online_queue,
+                )
+            )
+            torch.testing.assert_close(restored_buffer.storage[:], buffer.storage[:])
+        assert torch.equal(torch.random.get_rng_state(), saved_global_rng)
+
+    @pytest.mark.skipif(
+        not (_has_hydra and _has_omegaconf),
+        reason="requires hydra and omegaconf",
+    )
+    def test_dreamer_v3_wandb_resume_is_strict(self, device, monkeypatch):
+        repo_root = Path(__file__).parents[2]
+        example_dir = repo_root / "sota-implementations/dreamer_v3"
+        monkeypatch.syspath_prepend(str(example_dir))
+        example = runpy.run_path(
+            example_dir / "train.py", run_name="dreamer_v3_wandb_resume_test"
+        )
+        cfg = example["OmegaConf"].load(example_dir / "config.yaml")
+        cfg.logger.backend = "wandb"
+        captured = {}
+
+        class _Experiment:
+            id = "saved-run-id"
+
+            def define_metric(self, *args, **kwargs):
+                pass
+
+        class _WandbLogger:
+            def __init__(self, *args, **kwargs):
+                captured.update(kwargs)
+                self.experiment = _Experiment()
+
+        monkeypatch.setitem(
+            example["_RunLogger"].__init__.__globals__, "WandbLogger", _WandbLogger
+        )
+        run_logger = example["_RunLogger"](
+            cfg, None, resume_run_id="saved-run-id", resuming=True
+        )
+        assert run_logger.run_id == "saved-run-id"
+        assert captured["id"] == "saved-run-id"
+        assert captured["resume"] == "must"
+
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
     @pytest.mark.skipif(not _has_hoptorch, reason="requires hoptorch")
@@ -2306,3 +2550,7 @@ class TestDreamerV3SotaReplayIngestion:
         assert actual.keys() == expected.keys()
         for index, chunk in expected.items():
             self._assert_same(actual[index], chunk)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__])
