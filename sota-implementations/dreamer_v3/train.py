@@ -736,6 +736,10 @@ def _build_replay(
             sampler=sampler_type(
                 slice_len=sequence_records,
                 end_key=("next", "done"),
+                # One trajectory per stream: sequences may cross episode
+                # boundaries (the rollout resets on is_init), so terminal
+                # transitions and short episodes reach the learner.
+                traj_key="env_index",
             ),
             writer=TensorDictRoundRobinWriter(track_generations=True),
         )
