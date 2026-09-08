@@ -49,10 +49,10 @@ from torchrl.data import (
     ListStorage,
     ReplayBuffer,
     ReplayBufferEnsemble,
-    StreamingSliceSampler,
     TensorDictReplayBuffer,
     TensorDictRoundRobinWriter,
 )
+from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules.inference_server import (
     InferenceClient,
     InferenceDeviceConfig,
@@ -68,7 +68,10 @@ from torchrl.modules.inference_server import (
     SlotTransport,
     ThreadingTransport,
 )
-from torchrl.modules.inference_server._client import _REMOTE_INTERACTION_TYPE_KEY
+from torchrl.modules.inference_server._client import (
+    _INTERACTION_TYPE_TO_CODE,
+    _NO_INTERACTION_TYPE_CODE,
+)
 from torchrl.modules.inference_server._config import _resolve_device_config
 from torchrl.modules.inference_server._monarch import MonarchTransport
 from torchrl.modules.inference_server._server import _RayInferenceServerActor
@@ -152,6 +155,32 @@ class _BatchSizeModule(nn.Module):
 class _RandomModule(nn.Module):
     def forward(self, value):
         return torch.rand_like(value)
+
+
+class _InteractionTypeProbe(TensorDictModule):
+    """Stand-in for a probabilistic policy: records the sampling mode it runs under."""
+
+    def __init__(self):
+        super().__init__(
+            module=nn.Module(),  # placeholder
+            in_keys=["observation"],
+            out_keys=["action", "interaction_code"],
+        )
+
+    def forward(self, td: TensorDictBase) -> TensorDictBase:
+        observation = td.get("observation")
+        current = interaction_type()
+        code = (
+            _INTERACTION_TYPE_TO_CODE[current.value]
+            if current is not None
+            else _NO_INTERACTION_TYPE_CODE
+        )
+        td.set("action", torch.ones_like(observation))
+        return td.set("interaction_code", torch.full_like(observation, code))
+
+
+def _make_interaction_type_probe():
+    return _InteractionTypeProbe()
 
 
 # =============================================================================
@@ -1893,274 +1922,6 @@ class TestProcessSlotTransport:
             assert server.stats()["requests"] == 6
         assert all(result_queue.get(timeout=1.0) is True for _ in processes)
 
-    def test_batched_slot_io(self):
-        """Slots are gathered and scattered as batches, in the drained order."""
-        request_spec = TensorDict({"agent": {"observation": torch.zeros(4)}})
-        response_spec = TensorDict(
-            {
-                "agent": {"action": torch.zeros(2)},
-                "policy_version": torch.zeros((), dtype=torch.long),
-            }
-        )
-        transport = ProcessSlotTransport(request_spec, response_spec, num_slots=4)
-        clients = [transport.client() for _ in range(4)]
-        futures = [
-            client.submit(
-                TensorDict({"agent": {"observation": torch.full((4,), float(slot))}})
-            )
-            for slot, client in enumerate(clients)
-        ]
-        transport.wait_for_work(timeout=1.0)
-        slots, submitted_at = transport.drain_slots(3)
-        assert slots == [0, 1, 2]
-        assert all(isinstance(value, float) and value > 0 for value in submitted_at)
-
-        requests = transport.request_batch(4)
-        assert requests.batch_size == (4,)
-        assert not requests.is_locked
-        assert requests.get(_REMOTE_INTERACTION_TYPE_KEY).shape == (4,)
-        # Rows follow the given order, not the slot numbering, and the tail
-        # rows of the staging batch stay untouched.
-        transport.gather_requests([2, 0], out=requests)
-        assert torch.equal(
-            requests["agent", "observation"],
-            torch.tensor([2.0, 0.0, 0.0, 0.0]).unsqueeze(-1).expand(4, 4),
-        )
-        with pytest.raises(ValueError, match="Cannot gather 5"):
-            transport.gather_requests([0, 1, 2, 3, 0], out=requests)
-
-        responses = transport.response_batch(4)
-        responses["agent", "action"][:2] = torch.tensor([[20.0, 20.0], [0.0, 0.0]])
-        responses["policy_version"][:2] = 7
-        # A row count that does not match the slots is rejected before any
-        # slot is written or woken.
-        with pytest.raises(RuntimeError, match="batch size"):
-            transport.resolve_batch([2, 0], responses[:3])
-        assert not futures[2].done()
-        transport.resolve_batch([2, 0], responses[:2])
-        assert torch.equal(
-            futures[2].result(timeout=1.0)["agent", "action"], torch.full((2,), 20.0)
-        )
-        result_0 = futures[0].result(timeout=1.0)
-        assert torch.equal(result_0["agent", "action"], torch.zeros(2))
-        assert result_0["policy_version"] == 7
-        assert not futures[1].done()
-        # The per-request path still serves the remaining slots.
-        transport.resolve(
-            1, TensorDict({"agent": {"action": torch.ones(2)}, "policy_version": 1})
-        )
-        assert torch.equal(
-            futures[1].result(timeout=1.0)["agent", "action"], torch.ones(2)
-        )
-        items, callbacks = transport.drain(4)
-        assert callbacks == [3]
-        assert torch.equal(items[0]["agent", "observation"], torch.full((4,), 3.0))
-
-    def test_server_batched_pass_matches_inputs(self):
-        """Concurrent clients get their own results across many batched passes."""
-        request_spec = TensorDict({"agent": {"observation": torch.zeros(4)}})
-        response_spec = TensorDict(
-            {
-                "agent": {"action": torch.zeros(4)},
-                "policy_version": torch.zeros((), dtype=torch.long),
-            }
-        )
-        transport = ProcessSlotTransport(request_spec, response_spec, num_slots=4)
-        clients = [transport.client() for _ in range(4)]
-        model = TensorDictModule(
-            _Doubler(),
-            in_keys=[("agent", "observation")],
-            out_keys=[("agent", "action")],
-        )
-        errors = []
-
-        def run(idx):
-            try:
-                for i in range(10):
-                    obs = torch.full((4,), float(idx * 100 + i))
-                    result = clients[idx](TensorDict({"agent": {"observation": obs}}))
-                    assert torch.equal(result["agent", "action"], obs * 2.0)
-                    assert result["policy_version"] == 3
-            except Exception as exc:  # noqa: BLE001
-                errors.append(exc)
-
-        with InferenceServer(
-            model, transport, max_batch_size=4, policy_version=3
-        ) as server:
-            assert server._slot_batches is not None
-            threads = [threading.Thread(target=run, args=(i,)) for i in range(4)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=30.0)
-            stats = server.stats()
-        assert not errors
-        assert stats["requests"] == 40
-
-    def test_server_batched_pass_accumulates_min_batch(self):
-        """min_batch_size accumulation also applies to the batched slot pass."""
-        request_spec, response_spec = _make_shm_specs(
-            obs_size=1, act_size=1, with_version=False
-        )
-        transport = ProcessSlotTransport(request_spec, response_spec, num_slots=2)
-        clients = [transport.client() for _ in range(2)]
-        policy = TensorDictModule(
-            _BatchSizeModule(), in_keys=["observation"], out_keys=["action"]
-        )
-        results = {}
-
-        def run(idx):
-            results[idx] = clients[idx](TensorDict({"observation": torch.zeros(1)}))
-
-        with InferenceServer(
-            policy, transport, max_batch_size=2, min_batch_size=2, timeout=1.0
-        ):
-            threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join(timeout=30.0)
-        # Both requests were served by one pass of two.
-        assert torch.equal(results[0]["action"], torch.tensor([2.0]))
-        assert torch.equal(results[1]["action"], torch.tensor([2.0]))
-
-    def test_server_batched_pass_propagates_interaction_type(self):
-        """The interaction code is read from the host staging batch."""
-
-        class _InteractionPolicy(nn.Module):
-            def forward(self, td: TensorDictBase) -> TensorDictBase:
-                value = 1 if interaction_type() is InteractionType.RANDOM else 0
-                return TensorDict(
-                    {"action": torch.full(td.batch_size, value)},
-                    batch_size=td.batch_size,
-                )
-
-        request_spec = TensorDict({"observation": torch.zeros(1)})
-        response_spec = TensorDict({"action": torch.zeros((), dtype=torch.long)})
-        transport = ProcessSlotTransport(request_spec, response_spec, num_slots=1)
-        with InferenceServer(_InteractionPolicy(), transport, max_batch_size=1):
-            client = PolicyClientModule(transport.client(), out_keys=["action"])
-            with set_interaction_type(InteractionType.RANDOM):
-                result = client(TensorDict({"observation": torch.zeros(1)}))
-            assert result["action"].item() == 1
-            result = client(TensorDict({"observation": torch.zeros(1)}))
-            assert result["action"].item() == 0
-
-    def test_server_batched_pass_requires_declared_response_keys(self):
-        """A response key the model does not produce fails the request."""
-        request_spec, response_spec = _make_shm_specs(with_version=False)
-        transport = ProcessSlotTransport(request_spec, response_spec, num_slots=1)
-        client = transport.client()
-
-        def no_action(td):
-            return td.set("something_else", td["observation"])
-
-        with InferenceServer(no_action, transport, max_batch_size=1):
-            with pytest.raises(KeyError, match="action"):
-                client(TensorDict({"observation": torch.zeros(4)}))
-
-    def test_custom_collate_keeps_per_request_path(self):
-        """A transforming collate_fn is not bypassed by the batched pass."""
-        request_spec, response_spec = _make_shm_specs(act_size=4, with_version=False)
-        transport = ProcessSlotTransport(request_spec, response_spec, num_slots=1)
-        client = transport.client()
-
-        def offset_collate(items):
-            batch = lazy_stack(items).contiguous()
-            batch["observation"] += 1.0
-            return batch
-
-        with InferenceServer(
-            _make_doubling_policy(),
-            transport,
-            max_batch_size=1,
-            collate_fn=offset_collate,
-        ) as server:
-            assert server._slot_batches is None
-            result = client(TensorDict({"observation": torch.ones(4)}))
-        assert torch.equal(result["action"], torch.full((4,), 4.0))
-
-    @pytest.mark.gpu
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-    @pytest.mark.parametrize("static", [False, True])
-    def test_server_batched_pass_on_cuda(self, static):
-        """Pinned staging and one event per pass keep CUDA results exact.
-
-        Varying partial batches (padded for the graph), fresh random draws on
-        every replay and in-place weight updates all behave as on the
-        per-request path.
-        """
-
-        class _ScaleAndNoise(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.scale = nn.Parameter(torch.ones(()))
-
-            def forward(self, observation):
-                return observation * self.scale, torch.rand_like(observation)
-
-        policy = TensorDictModule(
-            _ScaleAndNoise(), in_keys=["observation"], out_keys=["action", "noise"]
-        )
-        request_spec = TensorDict({"observation": torch.zeros(2)})
-        response_spec = TensorDict(
-            {
-                "action": torch.zeros(2),
-                "noise": torch.zeros(2),
-                "policy_version": torch.zeros((), dtype=torch.long),
-            }
-        )
-        transport = ProcessSlotTransport(request_spec, response_spec, num_slots=3)
-        clients = [transport.client() for _ in range(3)]
-        with InferenceServer(
-            policy,
-            transport,
-            max_batch_size=4,
-            static_batch_size=4 if static else None,
-            request_spec=request_spec if static else None,
-            policy_device="cuda:0",
-        ) as server:
-            graph = server._cudagraph_model
-            assert (graph is not None) is static
-            assert server._slot_batches.host_request["observation"].is_pinned()
-            for round_index in range(3):
-                futures = [
-                    client.submit(
-                        TensorDict(
-                            {
-                                "observation": torch.tensor(
-                                    [float(10 * round_index + slot), -1.0]
-                                )
-                            }
-                        )
-                    )
-                    for slot, client in enumerate(clients)
-                ]
-                results = [future.result(timeout=10.0) for future in futures]
-                for slot, result in enumerate(results):
-                    assert result["action"].device.type == "cpu"
-                    assert torch.equal(
-                        result["action"],
-                        torch.tensor([float(10 * round_index + slot), -1.0]),
-                    )
-                    assert result["policy_version"] == 0
-                noises = torch.stack([result["noise"] for result in results])
-                assert (noises >= 0).all() and (noises < 1).all()
-                assert noises.unique().numel() == noises.numel()
-            first_noise = results[0]["noise"]
-            second = clients[0](TensorDict({"observation": torch.ones(2)}))
-            assert not torch.equal(second["noise"], first_noise)
-
-            def scale_weight(model):
-                with torch.no_grad():
-                    model.module.scale.fill_(3.0)
-
-            server.update_model(scale_weight)
-            assert server._cudagraph_model is graph
-            result = clients[1](TensorDict({"observation": torch.tensor([1.0, 2.0])}))
-            assert torch.equal(result["action"], torch.tensor([3.0, 6.0]))
-            assert result["policy_version"] == 1
-
 
 # =============================================================================
 # Tests: RayTransport (Commit 4)
@@ -2597,31 +2358,65 @@ class TestWeightSyncIntegration:
             result = client(TensorDict({}, batch_size=[1]))
             assert result["action"].item() == 0
 
+    def test_policy_client_explicit_interaction_type_wins_over_ambient_context(self):
+        transport = ThreadingTransport()
+        with InferenceServer(_InteractionTypeProbe(), transport, max_batch_size=4):
+            client = PolicyClientModule(
+                transport,
+                out_keys=["action", "interaction_code"],
+                interaction_type=InteractionType.RANDOM,
+            )
+            request = TensorDict({"observation": torch.zeros(1, dtype=torch.int32)})
+            with set_interaction_type(InteractionType.DETERMINISTIC):
+                result = client(request)
+            assert (
+                result["interaction_code"].item() == _INTERACTION_TYPE_TO_CODE["random"]
+            )
+            result = client(request)
+            assert (
+                result["interaction_code"].item() == _INTERACTION_TYPE_TO_CODE["random"]
+            )
+
+    def test_server_ignores_ambient_interaction_type_for_unstamped_requests(self):
+        transport = ThreadingTransport()
+        with InferenceServer(_InteractionTypeProbe(), transport, max_batch_size=4):
+            # A raw transport client attaches no interaction-type code; the
+            # serving thread's global says nothing about the request.
+            client = transport.client()
+            with set_interaction_type(InteractionType.RANDOM):
+                result = client(
+                    TensorDict({"observation": torch.zeros(1, dtype=torch.int32)})
+                )
+        assert result["interaction_code"].item() == _NO_INTERACTION_TYPE_CODE
+
     @pytest.mark.gpu
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-    def test_cudagraph_compares_effective_interaction_type(self):
-        class _InteractionValue(nn.Module):
-            def forward(self, observation):
-                value = 1 if interaction_type() is InteractionType.RANDOM else 0
-                return torch.full_like(observation, value)
-
-        policy = TensorDictModule(
-            _InteractionValue(), in_keys=["observation"], out_keys=["action"]
+    def test_cudagraph_captures_explicit_interaction_type(self):
+        request_spec = TensorDict({"observation": torch.zeros(1, dtype=torch.int32)})
+        server = InferenceServer(
+            _InteractionTypeProbe(),
+            transport="auto",
+            max_batch_size=1,
+            static_batch_size=1,
+            policy_device="cuda:0",
+            output_device="cpu",
         )
-        request_spec = TensorDict({"observation": torch.zeros(1)})
-        with set_interaction_type(InteractionType.RANDOM):
-            with InferenceServer(
-                policy,
-                transport="auto",
-                max_batch_size=1,
-                static_batch_size=1,
-                request_spec=request_spec,
-                policy_device="cuda:0",
-                output_device="cpu",
-            ) as server:
-                client = PolicyClientModule(server.transport, out_keys=["action"])
-                result = client(TensorDict({"observation": torch.ones(1)}))
-        assert result["action"].item() == 1
+        # The capture mode is explicit; the ambient context plays no role.
+        with set_interaction_type(InteractionType.DETERMINISTIC):
+            server.prepare_cudagraph(
+                request_spec, interaction_type=InteractionType.RANDOM
+            )
+        with server:
+            client = PolicyClientModule(
+                server.transport,
+                out_keys=["action", "interaction_code"],
+                interaction_type=InteractionType.RANDOM,
+            )
+            with set_interaction_type(InteractionType.DETERMINISTIC):
+                result = client(
+                    TensorDict({"observation": torch.ones(1, dtype=torch.int32)})
+                )
+        assert result["interaction_code"].item() == _INTERACTION_TYPE_TO_CODE["random"]
 
 
 # ---------------------------------------------------------------------------
@@ -2690,6 +2485,56 @@ def _make_bad_process_policy():
 def _make_slow_policy():
     time.sleep(30.0)
     return _make_counting_policy()
+
+
+def _toggle_deterministic_exploration(stop: threading.Event) -> None:
+    """Flip the process-wide interaction type the way a learner's loss forward does."""
+    while not stop.is_set():
+        with set_exploration_type(ExplorationType.DETERMINISTIC):
+            time.sleep(0.0005)
+        time.sleep(0.0005)
+
+
+def _collect_under_toggled_exploration(collector):
+    """Drain ``collector`` while another thread toggles the interaction type."""
+    stop = threading.Event()
+    toggler = threading.Thread(
+        target=_toggle_deterministic_exploration, args=(stop,), daemon=True
+    )
+    toggler.start()
+    try:
+        return list(collector)
+    finally:
+        stop.set()
+        toggler.join(timeout=5.0)
+        collector.shutdown()
+
+
+def _record_served_interaction_codes(monkeypatch) -> list[int]:
+    """Record the interaction code an in-process server resolves per batch."""
+    codes = []
+    original = InferenceServer._interaction_type_context
+
+    def record(server, batch):
+        context, batch, code = original(server, batch)
+        codes.append(code)
+        return context, batch, code
+
+    monkeypatch.setattr(InferenceServer, "_interaction_type_context", record)
+    return codes
+
+
+@pytest.fixture
+def restore_interaction_type():
+    """Reset tensordict's process-wide interaction type after the test.
+
+    The toggling thread and an in-process server thread enter and exit
+    ``set_interaction_type`` contexts on the same global; interleaved exits
+    can leave a stale value behind once both have stopped.
+    """
+    initial = interaction_type()
+    yield
+    set_interaction_type(initial).__enter__()
 
 
 class TestProcessInferenceServer:
@@ -3012,26 +2857,19 @@ class TestAsyncBatchedCollector:
             collector.shutdown()
 
     @pytest.mark.parametrize(
-        ("env_backend", "env_exchange", "envs_per_worker", "process_slots", "chunk"),
+        ("env_backend", "env_exchange", "envs_per_worker", "process_slots"),
         [
-            ("threading", "queue", 1, False, 1),
-            ("multiprocessing", "queue", 1, False, 1),
-            ("multiprocessing", "shm", 1, False, 1),
-            ("multiprocessing", "queue", 2, False, 1),
-            ("multiprocessing", "shm", 2, False, 1),
-            ("multiprocessing", "queue", 1, True, 1),
-            ("multiprocessing", "queue", 1, True, 4),
+            ("threading", "queue", 1, False),
+            ("multiprocessing", "queue", 1, False),
+            ("multiprocessing", "shm", 1, False),
+            ("multiprocessing", "queue", 2, False),
+            ("multiprocessing", "shm", 2, False),
+            ("multiprocessing", "queue", 1, True),
         ],
     )
     @pytest.mark.parametrize("background", [False, True])
     def test_parent_replay_write_and_post_collect_hook(
-        self,
-        env_backend,
-        env_exchange,
-        envs_per_worker,
-        process_slots,
-        chunk,
-        background,
+        self, env_backend, env_exchange, envs_per_worker, process_slots, background
     ):
         """Post-processing, hooks and routed writes run in the parent."""
         parent_thread = threading.get_ident()
@@ -3076,7 +2914,6 @@ class TestAsyncBatchedCollector:
             replay_buffer=replay_buffer,
             env_exchange=env_exchange,
             envs_per_worker=envs_per_worker,
-            transition_chunk_size=chunk,
             env_backend=env_backend,
         )
         try:
@@ -3106,19 +2943,18 @@ class TestAsyncBatchedCollector:
             assert (stored["env_index"] == env_id).all()
 
     @pytest.mark.parametrize(
-        ("env_backend", "env_exchange", "envs_per_worker", "process_slots", "chunk"),
+        ("env_backend", "env_exchange", "envs_per_worker", "process_slots"),
         [
-            ("threading", "queue", 1, False, 1),
-            ("multiprocessing", "queue", 1, False, 1),
-            ("multiprocessing", "shm", 1, False, 1),
-            ("multiprocessing", "queue", 2, False, 1),
-            ("multiprocessing", "shm", 2, False, 1),
-            ("multiprocessing", "queue", 1, True, 1),
-            ("multiprocessing", "queue", 1, True, 3),
+            ("threading", "queue", 1, False),
+            ("multiprocessing", "queue", 1, False),
+            ("multiprocessing", "shm", 1, False),
+            ("multiprocessing", "queue", 2, False),
+            ("multiprocessing", "shm", 2, False),
+            ("multiprocessing", "queue", 1, True),
         ],
     )
     def test_replay_backpressure_does_not_block_shutdown(
-        self, env_backend, env_exchange, envs_per_worker, process_slots, chunk
+        self, env_backend, env_exchange, envs_per_worker, process_slots
     ):
         replay_buffer = TensorDictReplayBuffer(storage=LazyTensorStorage(64))
         collector = AsyncBatchedCollector(
@@ -3135,7 +2971,6 @@ class TestAsyncBatchedCollector:
             replay_buffer=replay_buffer,
             env_exchange=env_exchange,
             envs_per_worker=envs_per_worker,
-            transition_chunk_size=chunk,
             env_backend=env_backend,
         )
         iterator = iter(collector)
@@ -3829,146 +3664,6 @@ class TestAsyncBatchedCollector:
             collector.shutdown()
         assert not any(worker.is_alive() for worker in workers)
 
-    @pytest.mark.parametrize("total_frames", [24, 26])
-    def test_process_slot_chunks_are_dense_and_ordered(self, total_frames):
-        """Chunked results form dense batches that keep each stream in order."""
-        num_envs = 3
-        collector = AsyncBatchedCollector(
-            create_env_fn=[ft.partial(_counting_env_factory, max_steps=10_000)]
-            * num_envs,
-            policy_factory=_make_counting_policy,
-            transport=_counting_process_transport(num_envs),
-            frames_per_batch=10,
-            total_frames=total_frames,
-            transition_chunk_size=4,
-            env_backend="multiprocessing",
-            server_config=InferenceServerConfig(
-                service_backend="process", max_batch_size=num_envs
-            ),
-        )
-        try:
-            batches = list(collector)
-        finally:
-            collector.shutdown()
-        # Exact budgets: chunks are split only where a batch or the total ends.
-        assert [batch.numel() for batch in batches] == [10, 10, total_frames - 20]
-        for batch in batches:
-            assert type(batch) is TensorDict
-            assert batch["env_index"].dtype == torch.long
-        stored = torch.cat(batches, 0)
-        assert stored["env_index"].unique().numel() > 1
-        for env_id in range(num_envs):
-            obs = stored[stored["env_index"] == env_id]["observation"].flatten()
-            torch.testing.assert_close(obs, torch.arange(len(obs), dtype=obs.dtype))
-
-    def test_process_slot_chunks_route_streams_and_sample_windows(self):
-        """Chunked writes reach the right stream and sample as contiguous windows."""
-        num_envs, slice_len = 3, 4
-        members = [
-            TensorDictReplayBuffer(
-                storage=LazyTensorStorage(64),
-                sampler=StreamingSliceSampler(
-                    slice_len=slice_len, end_key=("next", "done")
-                ),
-                writer=TensorDictRoundRobinWriter(track_generations=True),
-            )
-            for _ in range(num_envs)
-        ]
-        replay = ReplayBufferEnsemble(
-            *members,
-            p="sampleable",
-            num_buffer_sampled=2,
-            routing_key="env_index",
-            batch_size=2 * slice_len,
-        )
-        collector = AsyncBatchedCollector(
-            create_env_fn=[ft.partial(_counting_env_factory, max_steps=10_000)]
-            * num_envs,
-            policy_factory=_make_counting_policy,
-            transport=_counting_process_transport(num_envs),
-            frames_per_batch=12,
-            total_frames=96,
-            transition_chunk_size=slice_len,
-            replay_buffer=replay,
-            env_backend="multiprocessing",
-            server_config=InferenceServerConfig(
-                service_backend="process", max_batch_size=num_envs
-            ),
-        )
-        try:
-            collector.start()
-            collector._replay_thread.join(timeout=30)
-            assert not collector._replay_thread.is_alive()
-            assert replay.stats()["write_count"] == 96
-            for env_id, member in enumerate(members):
-                if not len(member):
-                    continue
-                stored = member[:]
-                assert (stored["env_index"] == env_id).all()
-                obs = stored["observation"].flatten()
-                torch.testing.assert_close(obs, torch.arange(len(obs), dtype=obs.dtype))
-            assert replay.can_sample()
-            for _ in range(4):
-                sample = replay.sample()
-                env_index = sample["env_index"].reshape(2, slice_len)
-                assert (env_index == env_index[:, :1]).all()
-                steps = sample["observation"].reshape(2, slice_len)
-                torch.testing.assert_close(
-                    steps - steps[:, :1],
-                    torch.arange(slice_len, dtype=steps.dtype).expand(2, -1),
-                )
-        finally:
-            collector.async_shutdown()
-
-    def test_process_slot_chunks_yield_completed_trajectories(self):
-        num_envs = 2
-        collector = AsyncBatchedCollector(
-            create_env_fn=[ft.partial(_counting_env_factory, max_steps=5)] * num_envs,
-            policy_factory=_make_counting_policy,
-            transport=_counting_process_transport(num_envs),
-            frames_per_batch=1,
-            total_frames=-1,
-            transition_chunk_size=4,
-            yield_completed_trajectories=True,
-            env_backend="multiprocessing",
-            server_config=InferenceServerConfig(
-                service_backend="process", max_batch_size=num_envs
-            ),
-        )
-        try:
-            iterator = iter(collector)
-            trajectories = [next(iterator) for _ in range(4)]
-        finally:
-            collector.shutdown()
-        for trajectory in trajectories:
-            assert trajectory.numel() == 6
-            env_index = trajectory["env_index"]
-            assert (env_index == env_index[0]).all()
-            obs = trajectory["observation"].flatten()
-            torch.testing.assert_close(obs, torch.arange(6, dtype=obs.dtype))
-            done = trajectory["next", "done"].flatten()
-            assert done[-1] and not done[:-1].any()
-
-    def test_transition_chunk_size_validation(self):
-        with pytest.raises(ValueError, match="positive integer"):
-            AsyncBatchedCollector(
-                create_env_fn=[_counting_env_factory] * 2,
-                policy_factory=_make_counting_policy,
-                transport=_counting_process_transport(2),
-                frames_per_batch=4,
-                transition_chunk_size=0,
-                env_backend="multiprocessing",
-                server_config=InferenceServerConfig(service_backend="process"),
-            )
-        with pytest.raises(ValueError, match="requires a ProcessSlotTransport"):
-            AsyncBatchedCollector(
-                create_env_fn=[_counting_env_factory] * 2,
-                policy=_make_counting_policy(),
-                frames_per_batch=4,
-                transition_chunk_size=2,
-                env_backend="threading",
-            )
-
     @pytest.mark.parametrize("failure", ["reset", "worker_death"])
     def test_process_slot_worker_failure_with_active_stream(self, failure):
         entered = mp.get_context("spawn").Event()
@@ -4209,6 +3904,94 @@ class TestAsyncBatchedCollector:
             total += batch.numel()
         collector.shutdown()
         assert total >= 20
+
+    @pytest.mark.parametrize("exploration_type", [None, ExplorationType.MODE])
+    def test_exploration_type_ignores_process_wide_interaction_type(
+        self, exploration_type, monkeypatch, restore_interaction_type
+    ):
+        """Requests carry the collector's mode, not the toggled global one."""
+        served_codes = _record_served_interaction_codes(monkeypatch)
+        kwargs = (
+            {} if exploration_type is None else {"exploration_type": exploration_type}
+        )
+        collector = AsyncBatchedCollector(
+            create_env_fn=[_counting_env_factory] * 4,
+            policy=_make_interaction_type_probe(),
+            frames_per_batch=16,
+            total_frames=256,
+            max_batch_size=4,
+            env_backend="threading",
+            **kwargs,
+        )
+        batches = _collect_under_toggled_exploration(collector)
+        expected = _INTERACTION_TYPE_TO_CODE[
+            (exploration_type or ExplorationType.RANDOM).value
+        ]
+        assert sum(batch.numel() for batch in batches) >= 256
+        # Every batch was homogeneous (a mixed batch raises) and used the
+        # collector's mode. The probe's own record is not checked here: the
+        # server thread's set_interaction_type is process-wide as well, so the
+        # toggling thread can still change what the forward observes.
+        assert served_codes and set(served_codes) == {expected}
+
+    def test_exploration_type_ignores_process_wide_interaction_type_process_server(
+        self, restore_interaction_type
+    ):
+        collector = AsyncBatchedCollector(
+            create_env_fn=[_counting_env_factory] * 4,
+            policy_factory=_make_interaction_type_probe,
+            frames_per_batch=16,
+            total_frames=128,
+            env_backend="threading",
+            server_config=InferenceServerConfig(
+                service_backend="process", max_batch_size=4
+            ),
+            exploration_type=ExplorationType.MODE,
+        )
+        batches = _collect_under_toggled_exploration(collector)
+        # The server process owns its own interaction-type global, so the
+        # probe's record is exact there.
+        codes = torch.cat([batch["interaction_code"].reshape(-1) for batch in batches])
+        assert codes.unique().tolist() == [_INTERACTION_TYPE_TO_CODE["mode"]]
+
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    @pytest.mark.parametrize("service_backend", ["thread", "process"])
+    def test_static_batch_exploration_type_ignores_process_wide_interaction_type(
+        self, service_backend, monkeypatch, restore_interaction_type
+    ):
+        """The graph is captured under the collector's mode, which every request carries."""
+        served_codes = _record_served_interaction_codes(monkeypatch)
+        if service_backend == "process":
+            policy_kwargs = {"policy_factory": _make_interaction_type_probe}
+        else:
+            policy_kwargs = {"policy": _make_interaction_type_probe()}
+        collector = AsyncBatchedCollector(
+            create_env_fn=[_counting_env_factory] * 2,
+            frames_per_batch=8,
+            total_frames=64,
+            env_backend="threading",
+            server_config=InferenceServerConfig(
+                service_backend=service_backend, max_batch_size=2, static_batch_size=2
+            ),
+            device_config=InferenceDeviceConfig(
+                policy_device="cuda:0",
+                output_device="cpu",
+                env_device="cpu",
+                storing_device="cpu",
+            ),
+            **policy_kwargs,
+        )
+        batches = _collect_under_toggled_exploration(collector)
+        expected = _INTERACTION_TYPE_TO_CODE[ExplorationType.RANDOM.value]
+        assert sum(batch.numel() for batch in batches) >= 64
+        if service_backend == "thread":
+            assert served_codes and set(served_codes) == {expected}
+        else:
+            codes = torch.cat(
+                [batch["interaction_code"].reshape(-1) for batch in batches]
+            )
+            assert codes.unique().tolist() == [expected]
 
 
 # =============================================================================
