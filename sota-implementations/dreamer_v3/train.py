@@ -647,6 +647,7 @@ def _build_collection(
                 # requires the queue setting here.
                 env_exchange="queue",
                 envs_per_worker=1,
+                transition_chunk_size=cfg.collector.transition_chunk_size,
                 server_config=server_config,
                 device_config=device_config,
                 policy_version_key=None,

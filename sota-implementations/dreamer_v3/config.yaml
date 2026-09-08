@@ -30,6 +30,8 @@ collector:
   # worker's shared-memory slot directly, so nothing crosses the driver on the
   # action path; needs async_env_backend=multiprocessing and envs_per_worker=1.
   inference_backend: thread
+  # Transitions each process-slot worker ships to the driver per message.
+  transition_chunk_size: 1
   num_envs: 1
   frames_per_batch: 200
   total_frames: 5000
