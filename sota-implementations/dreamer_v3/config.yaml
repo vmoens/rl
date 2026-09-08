@@ -1,22 +1,48 @@
 env:
-  backend: gym
+  backend: gym  # one of: gym, dm_control, custom
   name: Pendulum-v1
   task: null
   seed: 0
   use_seed: true
   max_episode_steps: 200
+  # custom backend: "package.module:function" import path of a factory called as
+  # factory(seed=..., env_index=..., num_envs=..., **factory_kwargs).
+  factory: null
+  factory_kwargs: {}
+  # Observation layout: a flat vector key and/or an image key (uint8 or [0, 1]
+  # float, channels first). null disables the corresponding path.
+  vector_key: observation
+  pixels_key: null
+  # Boolean vector of per-episode milestone flags under next, logged with each
+  # completed episode under the given names (asynchronous collection only).
+  milestone_key: null
+  milestone_names: []
 
 collector:
-  backend: sync  # one of: sync, async
-  async_env_backend: threading  # one of: threading, multiprocessing
+  backend: sync  # sync: Collector over SerialEnv; async: AsyncBatchedCollector
   num_envs: 1
   frames_per_batch: 200
-  total_frames: 5000
+  total_frames: 5000  # -1 runs until optimization.max_time
   count_reset_records: false
-  exploration: random  # one of: random, mode
+  exploration: random  # one of: random, mode (sync collector only)
+  # Asynchronous collection: environments step in their own processes or
+  # threads while an inference server batches policy calls.
+  policy_device: null  # device of the inference server, null = training device
+  env_backend: multiprocessing  # one of: multiprocessing, threading
+  # Data exchange with multiprocessing env workers: queue (shared tensors per
+  # transition) or shm (one fixed shared slot per env, bounded mappings).
+  env_exchange: queue
+  inference_max_batch_size: 16
+  inference_min_batch_size: 1
+  inference_timeout: 0.01
+  # Frames buffered ahead of the learner; environments pause when the buffer
+  # is full. null keeps environments running at full speed.
+  max_pending_frames: null
+  compile_policy: false
 
 replay_buffer:
   device: cpu  # null keeps replay on the training device
+  # Records kept in total (sync) or per environment stream (async).
   buffer_size: 10000
   batch_size: 16
   seq_len: 16
@@ -47,6 +73,11 @@ networks:
   value_layers: 3
   policy_min_std: 0.1
   policy_max_std: 1.0
+  # Image encoder and decoder (env.pixels_key), see DreamerV3ImageEncoder.
+  image_depth: 64
+  image_mults: [2, 3, 4, 4]
+  image_kernel_size: 5
+  image_decoder_blocks: 8
 
 optimization:
   device: null       # training device (models, losses, policy). null=auto
@@ -58,14 +89,14 @@ optimization:
   compile_rssm: null
   # Number of RSSM steps traced per higher-order scan iteration.
   rssm_scan_unroll: 8
-  # Compile the complete learner forward/backward with TorchInductor.
-  compile_train_step: false
-  # torch.compile mode for the complete learner step.
-  compile_train_step_mode: default
   # Capture the fixed-shape learner forward/backward on CUDA after warmup.
   cudagraph_train_step: false
-  # Synchronize CUDA around train-update timing. This disables CPU/GPU overlap.
-  sync_timers: false
+  # Compile and capture the learner on a fake batch before collection starts.
+  # null enables it whenever compile_rssm or cudagraph_train_step is set.
+  compile_warmup: null
+  # Collect without training for this many seconds first: measures the
+  # environment and inference throughput before the learner gates collection.
+  collection_warmup_seconds: 0
   lr: 4.0e-5
   optimizer_eps: 1.0e-20
   adaptive_grad_clip: 0.3
@@ -85,6 +116,8 @@ optimization:
   representation_loss_weight: 0.1
   gamma: 1.0
   lmbda: 0.95
+  # Wall-clock budget in seconds; null runs to collector.total_frames.
+  max_time: null
 
 logger:
   train_every: 200
@@ -92,6 +125,16 @@ logger:
   eval_episodes: 3
   output_plot: dreamer_v3_pendulum.png
   metrics_jsonl: null
+  # Optional experiment tracker: null or wandb (mirrors the JSONL records).
+  backend: null
+  project: torchrl-dreamer-v3
+  entity: null
+  # W&B server; null follows WANDB_BASE_URL (which imported libraries may change).
+  base_url: null
+  exp_name: null
+  group: null
+  tags: []
+  mode: online
 
 hydra:
   job:

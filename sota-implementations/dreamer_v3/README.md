@@ -26,10 +26,8 @@ without relying on wall-clock-dependent training iterations.
 
 The Walker task is seeded from `env.seed`, as every other TorchRL example is;
 pass `env.use_seed=false` for the JAX implementation's unseeded DMC resets. The
-step axis counts initial and reset-only driver records as that implementation
-does. Those counts are reporting and update-scheduling semantics only: replay
-stores the canonical transitions emitted by the collector and does not insert
-synthetic reset records.
+step axis counts initial and reset-only driver records as that
+implementation does.
 
 This is deliberately a reproduction of the pinned JAX `dmc_proprio` preset,
 not of the paper's proprioceptive protocol. The two protocols differ:
@@ -51,23 +49,6 @@ Real collection and evaluation environments run on CPU; `optimization.device`
 selects where the models, losses and policy run and defaults to `null`, which
 auto-selects an available accelerator. Pass `optimization.device=cpu` to force
 CPU execution.
-
-Replay is assembled entirely from reusable TorchRL components. One
-`TensorDictReplayBuffer` is allocated per environment stream and the configured
-`replay_buffer.buffer_size` is split across them. A routed
-`ReplayBufferEnsemble` writes synchronous collector batches by their environment
-dimension and asynchronous batches by `env_index`. Sampling chooses ready
-streams according to their available windows. `replay_buffer.online=true` uses
-`StreamingSliceSampler` to consume newly completed, non-overlapping windows
-before uniform fallback; `false` uses regular uniform `SliceSampler` sampling.
-Both modes sample `seq_len + 1` transitions so the learner can train on the
-first `seq_len` and conditionally refresh the following records' latent state.
-
-Set `collector.backend=async` to use `AsyncBatchedCollector`; the default is the
-synchronous `Collector`. `collector.async_env_backend` selects `threading` or
-`multiprocessing` for asynchronous environments. In both cases collection
-post-processing, episode reporting, device normalization, and replay writes
-happen through the collector's standard replay integration.
 
 For a three-seed median and interquartile reproduction run:
 
@@ -94,13 +75,6 @@ The timing excludes replay sampling and environment collection. Use the
 benchmark arguments to change the batch size, sequence length, scan unroll,
 warmup, or number of measured updates. Compilation and graph capture happen
 during warmup and are excluded from the reported samples.
-
-Pass `--replay-device cpu` or `--replay-device cuda` to benchmark the complete
-learner with the same routed replay stack used by training. Replay uses its
-built-in one-batch prefetch and ordered conditional updates, allowing sampling
-and latent writeback to overlap learner work. CPU replay samples are pinned and
-the complete contiguous sequence is transferred non-blockingly before it is
-sliced on the learner device.
 
 On one NVIDIA GB200 with PyTorch 2.12.0, CUDA 13.0, BF16, batch size 16,
 sequence length 64, scan unroll 8, 10 warmup updates and 50 measured updates:
@@ -154,31 +128,56 @@ recurrence and the imagination prior, and is faster, but its draws fall inside
 the compiled region, so a seeded run diverges from an eager one. The scan uses
 `optimization.rssm_scan_unroll=8` by default; lower values reduce compilation
 time and graph size, while `1` disables manual unrolling.
-`optimization.compile_train_step=true` compiles the complete learner forward
-and backward with TorchInductor, including the model, actor, value, and replay
-value losses. It subsumes `optimization.compile_rssm`, which is ignored to avoid
-nested compilation of shared RSSM modules. The compile mode defaults to
-`optimization.compile_train_step_mode=default`; autotuning modes are opt-in.
-Compilation and CUDA-graph warmup use a fixed-shape synthetic batch before the
-collector is constructed, so async collection is not live while Dynamo runs.
-When combined with `optimization.cudagraph_train_step=true`, the
-Inductor-compiled function is warmed up before CUDA graph capture.
 `optimization.cudagraph_train_step=true` captures the learner forward and
 backward after five warmup calls. It requires CUDA and fixed input shapes;
 optimizer and target-network steps remain outside capture so their schedules
-continue to advance normally.
+continue to advance normally. With either option on, the learner step is
+compiled and captured on a spec-shaped fake batch before collection starts
+(`optimization.compile_warmup`, on by default in that case); parameters,
+normalizer statistics and target networks are restored afterwards, and the
+optimizer does not step. Compiling while the asynchronous collector runs would
+otherwise share the interpreter with its threads and idle the environments for
+the whole compile.
 
-Train-update timing remains asynchronous by default. Set
-`optimization.sync_timers=true` when completed GPU timing is needed; this
-synchronizes around each measured update and intentionally disables CPU/GPU
-overlap.
+## Images, discrete actions and asynchronous collection
 
-To compare the existing CUDA-graph path with whole-step compilation, run:
+The script also trains from images, from a flat vector, or from both. `env.vector_key`
+names the flat observation (symlog MLP encoder, symlog squared-error decoder) and
+`env.pixels_key` a channels-first `uint8` image (`DreamerV3ImageEncoder` /
+`DreamerV3ImageDecoder`, squared error on the image divided by 255, sized by
+`networks.image_*`). A `OneHot` action spec selects a categorical actor with the
+reference's 1% uniform mixture; continuous actions keep the tanh-normal actor.
 
-```bash
-python benchmarks/ad_hoc/bench_dreamer_v3_learner.py \
-  --variants cuda_graph compiled_train_step_cuda_graph
-```
+`env.backend=custom` plugs in any environment through an import path,
+`env.factory=package.module:function`, called as
+`factory(seed=..., env_index=..., num_envs=..., **env.factory_kwargs)` and
+followed by the usual `StepCounter` and `InitTracker`.
 
-Each variant reports the median synchronized update time plus a one-update
-profiler sample with kernel count, summed GPU kernel time, and CPU launch time.
+`collector.backend=async` replaces the synchronous `Collector` with an
+`AsyncBatchedCollector`: `collector.num_envs` environments step independently in
+their own processes (`collector.env_backend`) while an inference server on
+`collector.policy_device` batches the policy calls
+(`collector.inference_max_batch_size`, `collector.inference_timeout`). Since the
+environments no longer share a time axis, replay keeps one ring per environment
+(`replay_buffer.buffer_size` records each) and batches draw their sequences across
+the rings. `collector.max_pending_frames` bounds the frames waiting for the
+learner so environments pause when it lags, like a samples-per-insert limiter;
+`optimization.deferred_policy_sync=true` is required because the server owns a
+copy of the policy that is refreshed between batches. Environments that expose a
+boolean `env.milestone_key` vector have its flags logged at the end of every
+episode under `env.milestone_names`.
+
+`optimization.collection_warmup_seconds` delays the first update so the
+environments and the inference server run unthrottled for that long, which
+measures their throughput before the train ratio couples collection to the
+learner; `collector.compile_policy=true` compiles the acting policy and traces
+it for the served batch sizes before collection starts, falling back to the
+eager policy if compilation fails.
+
+`optimization.max_time` stops a run after a wall-clock budget (with
+`collector.total_frames=-1` for an unbounded frame budget), and
+`logger.backend=wandb` mirrors every JSONL record to Weights & Biases
+(`logger.project`, `logger.entity`, `logger.exp_name`, and `logger.base_url` to
+pin the server when an imported library redirects `WANDB_BASE_URL`), including the collection
+rates, the inference-server statistics and the learner timings that the `train`
+records carry.
