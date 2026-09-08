@@ -3,15 +3,14 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 """The DreamerV3 networks, acting policy, optimizer and builders."""
-
 from __future__ import annotations
 
 import importlib
 import importlib.util
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import torch
-from dreamer_v3_utils import latent_state_dim
+from dreamer_v3_utils import latent_state_dim, POLICY_RNG_STREAM, stream_seed
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDictBase
 from tensordict.nn import (
@@ -23,6 +22,7 @@ from tensordict.nn import (
     TensorDictSequential,
 )
 from tensordict.utils import NestedKey, unravel_key
+
 from torchrl.data import Unbounded
 from torchrl.envs import EnvBase, StepCounter, TransformedEnv
 from torchrl.envs.libs.gym import GymEnv
@@ -35,15 +35,15 @@ from torchrl.envs.transforms import (
     TensorDictPrimer,
 )
 from torchrl.modules import (
-    DreamerV3DiscreteActor,
     DreamerV3ImageDecoder,
     DreamerV3ImageEncoder,
     DreamerV3MLP,
-    RSSMStateEstimatorV3,
     SymExpTwoHot,
     WorldModelWrapper,
 )
 from torchrl.modules.distributions.continuous import IndependentNormal
+from torchrl.modules.distributions.discrete import OneHotCategorical
+from torchrl.modules.models.model_based import _unimix_probs
 from torchrl.modules.models.model_based_v3 import (
     _dreamer_v3_init,
     RSSMPosteriorV3,
@@ -51,7 +51,6 @@ from torchrl.modules.models.model_based_v3 import (
     RSSMRolloutV3,
 )
 from torchrl.objectives import symexp, symlog
-from torchrl.trainers.algorithms.configs.common import _normalize_hydra_key
 
 _has_dm_control = importlib.util.find_spec("dm_control") is not None
 
@@ -70,6 +69,21 @@ def _strip_next(key: NestedKey) -> NestedKey:
     if isinstance(key, tuple) and key[0] == "next":
         return key[1] if len(key) == 2 else key[1:]
     return key
+
+
+class _Concat(torch.nn.Module):
+    def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
+        return torch.cat(inputs, -1)
+
+
+def vector_key(cfg: DictConfig) -> str | None:
+    """The flat vector observation key, ``None`` when the env has none."""
+    return cfg.env.get("vector_key", "observation")
+
+
+def pixels_key(cfg: DictConfig) -> str | None:
+    """The image observation key, ``None`` when the env has none."""
+    return cfg.env.get("pixels_key", None)
 
 
 # --- Networks and the acting policy ---
@@ -139,6 +153,62 @@ class _DreamerV3Actor(torch.nn.Module):
         std = (self.max_std - self.min_std) * torch.sigmoid(std + 2) + self.min_std
         # The Normal parameters stay FP32, also under BF16 autocast.
         return mean.float(), std.float()
+
+
+class _DreamerV3DiscreteActor(torch.nn.Module):
+    """Categorical actor with the uniform mixture of the reference implementation."""
+
+    def __init__(self, cfg: DictConfig, action_dim: int):
+        super().__init__()
+        state_dim = latent_state_dim(cfg)
+        self.backbone = DreamerV3MLP(
+            state_dim + cfg.networks.rnn_hidden_dim,
+            None,
+            depth=cfg.networks.actor_layers,
+            num_cells=cfg.networks.hidden_dim,
+            norm_eps=cfg.networks.norm_eps,
+        )
+        self.logits_head = torch.nn.Linear(cfg.networks.hidden_dim, action_dim)
+        self.logits_head.apply(_dreamer_v3_init)
+        with torch.no_grad():
+            self.logits_head.weight.mul_(0.01)
+        self.unimix = cfg.networks.unimix
+
+    def forward(self, state: torch.Tensor, belief: torch.Tensor) -> torch.Tensor:
+        hidden = self.backbone(belief, state)
+        logits = self.logits_head(hidden).float()
+        return torch.log(_unimix_probs(logits, self.unimix))
+
+
+class _DreamerV3PolicyFilter(torch.nn.Module):
+    def __init__(
+        self,
+        prior_net: torch.nn.Module,
+        posterior_net: torch.nn.Module,
+    ):
+        super().__init__()
+        self.prior_net = prior_net
+        self.posterior_net = posterior_net
+
+    def forward(
+        self,
+        state: torch.Tensor,
+        belief: torch.Tensor,
+        previous_action: torch.Tensor,
+        encoded_latents: torch.Tensor,
+        is_init: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        reset = is_init
+        while reset.ndim < state.ndim:
+            reset = reset.unsqueeze(-1)
+        state = torch.where(reset, 0, state)
+        belief = torch.where(reset, 0, belief)
+        previous_action = torch.where(reset, 0, previous_action)
+        # Advance the recurrence only. The posterior reads the observation.
+        belief = self.prior_net._update_belief(state, belief, previous_action)
+        _, state = self.posterior_net(belief, encoded_latents)
+        # The collector and the replay entries use FP32.
+        return state.float(), belief.float()
 
 
 class _DreamerV3PolicyCarry(torch.nn.Module):
@@ -228,6 +298,144 @@ class DreamerV3BehaviorPolicySync:
         for target, source in zip(self._behavior_parameters, self._pending):
             target.copy_(source)
         self._pending = None
+
+
+class DreamerV3SeededPolicy(TensorDictModuleBase):
+    """Give the policy its own random stream, with a new seed for each call."""
+
+    def __init__(self, module: TensorDictModuleBase, seed: int):
+        super().__init__()
+        self.module = module
+        self.seed = seed
+        self.counter = 0
+        self.in_keys = module.in_keys
+        self.out_keys = module.out_keys
+
+    def reset_counter(self) -> None:
+        """Restart the counter, because a setup call can move it before step 0."""
+        self.counter = 0
+
+    def forward(self, tensordict: TensorDictBase) -> TensorDictBase:
+        reference = tensordict.get("state", None)
+        if reference is None:
+            reference = tensordict.get(self.in_keys[0])
+        devices = [reference.device] if reference.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(stream_seed(self.seed, self.counter, POLICY_RNG_STREAM))
+            self.counter += 1
+            return self.module(tensordict)
+
+
+# --- Optimizer ---
+
+
+class DreamerV3Optimizer(torch.optim.Optimizer):
+    """The DreamerV3 optimizer: AGC, RMS scaling, momentum and warmup.
+
+    AGC clips each gradient to the ``agc`` fraction of its parameter norm.
+    """
+
+    def __init__(
+        self,
+        parameters: Iterable[torch.nn.Parameter],
+        *,
+        lr: float = 4e-5,
+        agc: float = 0.3,
+        parameter_norm_min: float = 1e-3,
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        eps: float = 1e-20,
+        warmup_steps: int = 1000,
+    ):
+        super().__init__(
+            parameters,
+            {
+                "lr": lr,
+                "agc": agc,
+                "parameter_norm_min": parameter_norm_min,
+                "beta1": beta1,
+                "beta2": beta2,
+                "eps": eps,
+                "warmup_steps": warmup_steps,
+                "step": 0,
+            },
+        )
+
+    @torch.no_grad()
+    def step(self, closure: Callable[[], torch.Tensor] | None = None) -> None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            group["step"] += 1
+            step = group["step"]
+            warmup_steps = group["warmup_steps"]
+            schedule_step = step - 1
+            warmup = min(1.0, schedule_step / warmup_steps) if warmup_steps else 1.0
+            learning_rate = group["lr"] * warmup
+
+            # Group by device and dtype for the multi-tensor kernels.
+            buckets: dict[
+                tuple[torch.device, torch.dtype], list[torch.nn.Parameter]
+            ] = {}
+            for parameter in group["params"]:
+                if parameter.grad is not None:
+                    buckets.setdefault((parameter.device, parameter.dtype), []).append(
+                        parameter
+                    )
+
+            for parameters in buckets.values():
+                gradients = [parameter.grad.float() for parameter in parameters]
+                if group["agc"]:
+                    gradient_norms = list(torch._foreach_norm(gradients))
+                    parameter_norms = list(
+                        torch._foreach_norm(
+                            [parameter.detach().float() for parameter in parameters]
+                        )
+                    )
+                    torch._foreach_clamp_min_(
+                        parameter_norms, group["parameter_norm_min"]
+                    )
+                    maximum_norms = torch._foreach_mul(parameter_norms, group["agc"])
+                    gradient_denominators = torch._foreach_maximum(
+                        gradient_norms, maximum_norms
+                    )
+                    gradient_scales = torch._foreach_div(
+                        maximum_norms, gradient_denominators
+                    )
+                    gradients = list(torch._foreach_mul(gradients, gradient_scales))
+
+                rms = []
+                momentum = []
+                for parameter in parameters:
+                    state = self.state[parameter]
+                    if not state:
+                        state["rms"] = torch.zeros_like(parameter, dtype=torch.float32)
+                        state["momentum"] = torch.zeros_like(
+                            parameter, dtype=torch.float32
+                        )
+                    rms.append(state["rms"])
+                    momentum.append(state["momentum"])
+                beta1 = group["beta1"]
+                beta2 = group["beta2"]
+                torch._foreach_mul_(rms, beta2)
+                torch._foreach_addcmul_(rms, gradients, gradients, value=1 - beta2)
+                rms_hat = torch._foreach_div(rms, 1 - beta2**step)
+                rms_denominator = torch._foreach_sqrt(rms_hat)
+                torch._foreach_add_(rms_denominator, group["eps"])
+                normalized = torch._foreach_div(gradients, rms_denominator)
+                torch._foreach_mul_(momentum, beta1)
+                torch._foreach_add_(momentum, normalized, alpha=1 - beta1)
+                momentum_hat = torch._foreach_div(momentum, 1 - beta1**step)
+                if parameters[0].dtype != torch.float32:
+                    momentum_hat = [
+                        update.to(parameter.dtype)
+                        for update, parameter in zip(momentum_hat, parameters)
+                    ]
+                torch._foreach_add_(parameters, momentum_hat, alpha=-learning_rate)
+        return loss
 
 
 # --- Builders ---
@@ -331,7 +539,6 @@ def build_world_model(
     obs_dim: int,
     action_dim: int,
     pixels_shape: tuple[int, int, int] | None = None,
-    compile_rollout: bool = True,
 ) -> tuple[TensorDictSequential, RSSMPriorV3, DreamerV3MLP, SymExpTwoHot, DreamerV3MLP]:
     """Build the world model: encoder, RSSM rollout, decoder and two heads.
 
@@ -340,14 +547,12 @@ def build_world_model(
     the ``(C, H, W)`` shape of the image observation stored under
     ``cfg.env.pixels_key``; ``None`` disables the image path. The decoded
     vector is written to ``("next", "reco_pixels")`` without an image, which
-    keeps the vector-only keys unchanged, and to ``("next", "reco_vector")``
+    keeps the vector-only keys unchanged, and to ``("next", "reco_<vector_key>")``
     next to the decoded image otherwise.
     """
     state_dim = latent_state_dim(cfg)
-    vector = _normalize_hydra_key(cfg.env.vector_key) if obs_dim else None
-    pixels = (
-        _normalize_hydra_key(cfg.env.pixels_key) if pixels_shape is not None else None
-    )
+    vector = vector_key(cfg) if obs_dim else None
+    pixels = (pixels_key(cfg) or "pixels") if pixels_shape is not None else None
     if vector is None and pixels is None:
         raise ValueError(
             "The world model needs a vector observation, an image observation, "
@@ -366,7 +571,7 @@ def build_world_model(
                 TensorDictModule(
                     symlog,
                     in_keys=[("next", vector)],
-                    out_keys=[("next", "symlog_observation")],
+                    out_keys=[("next", f"symlog_{vector}")],
                 ),
                 TensorDictModule(
                     DreamerV3MLP(
@@ -377,7 +582,7 @@ def build_world_model(
                         num_cells=cfg.networks.hidden_dim,
                         norm_eps=cfg.networks.norm_eps,
                     ),
-                    in_keys=[("next", "symlog_observation")],
+                    in_keys=[("next", f"symlog_{vector}")],
                     out_keys=[vector_embedding],
                 ),
             ]
@@ -405,10 +610,10 @@ def build_world_model(
         embed_dim += image_encoder.output_features(pixels_shape)
     if vector is not None and pixels is not None:
         encoder_modules.append(
-            CatTensors(
+            TensorDictModule(
+                _Concat(),
                 in_keys=[("next", "encoded_pixels"), ("next", "encoded_vector")],
-                out_key=("next", "encoded_latents"),
-                del_keys=False,
+                out_keys=[("next", "encoded_latents")],
             )
         )
     encoder = TensorDictSequential(*encoder_modules)
@@ -454,10 +659,10 @@ def build_world_model(
         out_keys=[("next", "posterior_logits"), ("next", "state")],
     )
 
-    # Canonical transitions retain is_init. Native replay slices stay within
-    # one episode, and the rollout handles a reset at the first transition.
+    # Only the reset record of an episode has is_init set, thus a sampled
+    # window can cross an episode boundary.
     rollout = RSSMRolloutV3(rssm_prior, rssm_posterior, reset_key="is_init")
-    if compile_rollout and cfg.optimization.compile_rssm:
+    if cfg.optimization.compile_rssm:
         rollout.compile_rollout(
             cfg.optimization.compile_rssm,
             unroll=(
@@ -475,8 +680,8 @@ def build_world_model(
                 "Decoder event dimensions must sum to the flattened observation "
                 f"size, got {decoder_event_dims} for {obs_dim}."
             )
-        reco_symlog_key = ("next", "reco_symlog_observation")
-        reco_key = ("next", "reco_pixels" if pixels is None else "reco_vector")
+        reco_symlog_key = ("next", f"reco_symlog_{vector}")
+        reco_key = ("next", "reco_pixels" if pixels is None else f"reco_{vector}")
         # One head for each event: AGC clips each head separately, thus a merged
         # head trains differently. The FP32 symexp keeps the loss symlog exact.
         decoder_modules.extend(
@@ -506,7 +711,8 @@ def build_world_model(
             num_blocks=cfg.networks.image_decoder_blocks,
             norm_eps=cfg.networks.norm_eps,
         )
-        # The unbounded image prediction targets pixels / 255 with squared error.
+        # The decoded image lives in the [0, 1] range of pixels / 255 and is
+        # trained with a plain squared error, like the reference.
         decoder_modules.extend(
             [
                 TensorDictModule(
@@ -623,13 +829,20 @@ def build_actor(
 ) -> ProbabilisticTensorDictSequential:
     """Build the actor; ``discrete`` selects a one-hot categorical policy."""
     if discrete:
-        return DreamerV3DiscreteActor(
-            latent_state_dim(cfg) + cfg.networks.rnn_hidden_dim,
-            action_dim,
-            depth=cfg.networks.actor_layers,
-            num_cells=cfg.networks.hidden_dim,
-            norm_eps=cfg.networks.norm_eps,
-            unimix=cfg.networks.unimix,
+        return ProbabilisticTensorDictSequential(
+            TensorDictModule(
+                _DreamerV3DiscreteActor(cfg, action_dim),
+                in_keys=["state", "belief"],
+                out_keys=["logits"],
+            ),
+            ProbabilisticTensorDictModule(
+                in_keys=["logits"],
+                out_keys=["action"],
+                default_interaction_type=InteractionType.RANDOM,
+                distribution_class=OneHotCategorical,
+                return_log_prob=True,
+                log_prob_key="action_log_prob",
+            ),
         )
     actor_mlp = _DreamerV3Actor(cfg, action_dim)
     actor_model = ProbabilisticTensorDictSequential(
@@ -665,21 +878,27 @@ def build_real_world_actor(
     posterior_net = rssm_rollout.rssm_posterior.module
     # The acting encoder shares the world-model modules and reads the current
     # observation instead of the next one.
-    acting_encoder = []
-    for module in world_model[0].module:
-        in_keys = [_strip_next(key) for key in module.in_keys]
-        out_keys = [_strip_next(key) for key in module.out_keys]
-        if isinstance(module, CatTensors):
-            acting_encoder.append(
-                CatTensors(in_keys=in_keys, out_key=out_keys[0], del_keys=False)
-            )
-        else:
-            acting_encoder.append(
-                TensorDictModule(module.module, in_keys=in_keys, out_keys=out_keys)
-            )
+    acting_encoder = [
+        TensorDictModule(
+            module.module,
+            in_keys=[_strip_next(key) for key in module.in_keys],
+            out_keys=[_strip_next(key) for key in module.out_keys],
+        )
+        for module in world_model[0].module
+    ]
     policy = TensorDictSequential(
         *acting_encoder,
-        RSSMStateEstimatorV3(prior_net, posterior_net),
+        TensorDictModule(
+            _DreamerV3PolicyFilter(prior_net, posterior_net),
+            in_keys=[
+                "state",
+                "belief",
+                "previous_action",
+                "encoded_latents",
+                "is_init",
+            ],
+            out_keys=["state", "belief"],
+        ),
         actor_model,
         TensorDictModule(
             _DreamerV3PolicyCarry(),
@@ -743,12 +962,7 @@ def build_mb_env(
         belief_shape=torch.Size([cfg.networks.rnn_hidden_dim]),
         device=device,
     )
-    try:
-        mb_env.set_specs_from_env(primer_env)
-        # Imagination produces latent state, not real sensor or milestone data.
-        mb_env.observation_spec = mb_env.state_spec.clone()
-    finally:
-        primer_env.close()
+    mb_env.set_specs_from_env(primer_env)
     with torch.no_grad():
         mb_env.rollout(3)
     return mb_env

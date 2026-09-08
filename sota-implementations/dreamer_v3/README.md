@@ -26,10 +26,8 @@ without relying on wall-clock-dependent training iterations.
 
 The Walker task is seeded from `env.seed`, as every other TorchRL example is;
 pass `env.use_seed=false` for the JAX implementation's unseeded DMC resets. The
-step axis counts initial and reset-only driver records as that implementation
-does. Those counts are reporting and update-scheduling semantics only: replay
-stores the canonical transitions emitted by the collector and does not insert
-synthetic reset records.
+step axis counts initial and reset-only driver records as that
+implementation does.
 
 This is deliberately a reproduction of the pinned JAX `dmc_proprio` preset,
 not of the paper's proprioceptive protocol. The two protocols differ:
@@ -51,23 +49,6 @@ Real collection and evaluation environments run on CPU; `optimization.device`
 selects where the models, losses and policy run and defaults to `null`, which
 auto-selects an available accelerator. Pass `optimization.device=cpu` to force
 CPU execution.
-
-Replay is assembled entirely from reusable TorchRL components. One
-`TensorDictReplayBuffer` is allocated per environment stream and the configured
-`replay_buffer.buffer_size` is split across them. A routed
-`ReplayBufferEnsemble` writes synchronous collector batches by their environment
-dimension and asynchronous batches by `env_index`. Sampling chooses ready
-streams according to their available windows. `replay_buffer.online=true` uses
-`StreamingSliceSampler` to consume newly completed, non-overlapping windows
-before uniform fallback; `false` uses regular uniform `SliceSampler` sampling.
-Both modes sample `seq_len + 1` transitions so the learner can train on the
-first `seq_len` and conditionally refresh the following records' latent state.
-
-Set `collector.backend=async` to use `AsyncBatchedCollector`; the default is the
-synchronous `Collector`. `collector.async_env_backend` selects `threading` or
-`multiprocessing` for asynchronous environments. In both cases collection
-post-processing, episode reporting, device normalization, and replay writes
-happen through the collector's standard replay integration.
 
 For a three-seed median and interquartile reproduction run:
 
@@ -94,13 +75,6 @@ The timing excludes replay sampling and environment collection. Use the
 benchmark arguments to change the batch size, sequence length, scan unroll,
 warmup, or number of measured updates. Compilation and graph capture happen
 during warmup and are excluded from the reported samples.
-
-Pass `--replay-device cpu` or `--replay-device cuda` to benchmark the complete
-learner with the same routed replay stack used by training. Replay uses its
-built-in one-batch prefetch and ordered conditional updates, allowing sampling
-and latent writeback to overlap learner work. CPU replay samples are pinned and
-the complete contiguous sequence is transferred non-blockingly before it is
-sliced on the learner device.
 
 On one NVIDIA GB200 with PyTorch 2.12.0, CUDA 13.0, BF16, batch size 16,
 sequence length 64, scan unroll 8, 10 warmup updates and 50 measured updates:
@@ -154,169 +128,56 @@ recurrence and the imagination prior, and is faster, but its draws fall inside
 the compiled region, so a seeded run diverges from an eager one. The scan uses
 `optimization.rssm_scan_unroll=8` by default; lower values reduce compilation
 time and graph size, while `1` disables manual unrolling.
-`optimization.compile_train_step=true` compiles the complete learner forward
-and backward with TorchInductor, including the model, actor, value, and replay
-value losses. It subsumes `optimization.compile_rssm`, which is ignored to avoid
-nested compilation of shared RSSM modules. The compile mode defaults to
-`optimization.compile_train_step_mode=default`; autotuning modes are opt-in.
-Compilation and CUDA-graph warmup use a fixed-shape synthetic batch before the
-collector is constructed, so async collection is not live while Dynamo runs.
-When combined with `optimization.cudagraph_train_step=true`, the
-Inductor-compiled function is warmed up before CUDA graph capture.
 `optimization.cudagraph_train_step=true` captures the learner forward and
 backward after five warmup calls. It requires CUDA and fixed input shapes;
 optimizer and target-network steps remain outside capture so their schedules
-continue to advance normally.
+continue to advance normally. With either option on, the learner step is
+compiled and captured on a spec-shaped fake batch before collection starts
+(`optimization.compile_warmup`, on by default in that case); parameters,
+normalizer statistics and target networks are restored afterwards, and the
+optimizer does not step. Compiling while the asynchronous collector runs would
+otherwise share the interpreter with its threads and idle the environments for
+the whole compile.
 
-Train-update timing remains asynchronous by default. Set
-`optimization.sync_timers=true` when completed GPU timing is needed; this
-synchronizes around each measured update and intentionally disables CPU/GPU
-overlap.
+## Images, discrete actions and asynchronous collection
 
-To compare the existing CUDA-graph path with whole-step compilation, run:
+The script also trains from images, from a flat vector, or from both. `env.vector_key`
+names the flat observation (symlog MLP encoder, symlog squared-error decoder) and
+`env.pixels_key` a channels-first `uint8` image (`DreamerV3ImageEncoder` /
+`DreamerV3ImageDecoder`, squared error on the image divided by 255, sized by
+`networks.image_*`). A `OneHot` action spec selects a categorical actor with the
+reference's 1% uniform mixture; continuous actions keep the tanh-normal actor.
 
-```bash
-python benchmarks/ad_hoc/bench_dreamer_v3_learner.py \
-  --variants cuda_graph compiled_train_step_cuda_graph
-```
+`env.backend=custom` plugs in any environment through an import path,
+`env.factory=package.module:function`, called as
+`factory(seed=..., env_index=..., num_envs=..., **env.factory_kwargs)` and
+followed by the usual `StepCounter` and `InitTracker`.
 
-Each variant reports the median synchronized update time plus a one-update
-profiler sample with kernel count, summed GPU kernel time, and CPU launch time.
+`collector.backend=async` replaces the synchronous `Collector` with an
+`AsyncBatchedCollector`: `collector.num_envs` environments step independently in
+their own processes (`collector.env_backend`) while an inference server on
+`collector.policy_device` batches the policy calls
+(`collector.inference_max_batch_size`, `collector.inference_timeout`). Since the
+environments no longer share a time axis, replay keeps one ring per environment
+(`replay_buffer.buffer_size` records each) and batches draw their sequences across
+the rings. `collector.max_pending_frames` bounds the frames waiting for the
+learner so environments pause when it lags, like a samples-per-insert limiter;
+`optimization.deferred_policy_sync=true` is required because the server owns a
+copy of the policy that is refreshed between batches. Environments that expose a
+boolean `env.milestone_key` vector have its flags logged at the end of every
+episode under `env.milestone_names`.
 
+`optimization.collection_warmup_seconds` delays the first update so the
+environments and the inference server run unthrottled for that long, which
+measures their throughput before the train ratio couples collection to the
+learner; `collector.compile_policy=true` compiles the acting policy and traces
+it for the served batch sizes before collection starts, falling back to the
+eager policy if compilation fails.
 
-## Custom environments, observations and actions
-
-The standard configuration retains its Pendulum environment, synchronous collection,
-training defaults and optional JSONL output. A custom environment factory can select
-nested observation keys without changing the learner or replay implementation:
-
-```yaml
-env:
-  backend: custom
-  factory: my_envs:make_env
-  factory_kwargs: {}
-  vector_key: [sensors, vector]
-  pixels_key: [sensors, image]
-  milestone_key: [episode, milestones]
-  milestone_names: [started, completed]
-collector:
-  backend: async
-  async_env_backend: multiprocessing
-  env_exchange: shm
-  envs_per_worker: 4
-```
-
-The importable factory receives `seed`, `env_index`, `num_envs` and the configured
-keyword arguments, and returns one TorchRL environment. Multiprocessing factories
-must be spawn-compatible. Set either observation key to `null` to disable that
-path. Vector observations have one feature dimension; images use channels-first
-`(C, H, W)` shape and either uint8 pixels or floating-point values scaled to `[0, 1]`.
-Image dimensions must match the configured encoder/decoder downsampling stages.
-The image decoder predicts unconstrained values against normalized pixel targets.
-Continuous vector actions and discrete `OneHot` action specs are supported.
-
-Discrete policies use the public `torchrl.modules.DreamerV3DiscreteActor`.
-It owns the normalized network, DreamerV3 initialization, uniform probability
-mixture and one-hot sampling. The recipe only supplies dimensions and configured
-hyperparameters; standalone users can construct the actor directly or through
-`DreamerV3DiscreteActorConfig` and use `get_dist()` for imagination.
-
-Milestone flags are read from the configured key under `next` at each completed
-episode. Their boolean vector must match `milestone_names`. Both synchronous and
-asynchronous runs log these flags with episode returns. Imagination runs only in
-latent state and does not require real sensor or milestone observations.
-
-Asynchronous collection supports `env_exchange`, `envs_per_worker`, a separate
-`policy_device`, and the existing inference batch size/timeout settings. Setting
-`inference_static_batch_size` enables fixed-size CUDA-graph policy batches and
-requires a CUDA policy device. The default maximum inference batch size remains
-`num_envs`. Native replay performs all insertion in the parent process and checks
-write generations before applying latent-context updates.
-
-## Logging and time budgets
-
-`logger.backend` selects an optional TorchRL logger, for example `csv`,
-`tensorboard` or `wandb`; JSONL logging can remain enabled alongside it. Use
-`logger.log_dir` and `logger.exp_name` for local output. W&B additionally accepts
-`project`, `entity`, `group`, `tags`, `mode` and an explicit `base_url`. The latter
-is passed to W&B settings and takes precedence over its environment-variable
-server setting. Tracker metrics use the environment-step counter.
-
-`optimization.max_time` is a positive wall-clock budget in seconds, checked after
-completed collection batches. An unlimited frame budget (`collector.total_frames=-1`)
-requires a time budget. A current batch or learner update is allowed to finish;
-this is not a hard process deadline. `optimization.collection_warmup_seconds`
-collects into native replay without training for that duration, measured from the
-first completed collection batch. Both options preserve their disabled defaults.
-Compilation and capture warm-up complete before collection starts, using the real
-observation specs and the same learner input keys as native replay. Gradient
-buffers remain attached after capture, and an optimizer step without parameter
-gradients fails explicitly.
-
-
-Checkpoint saving is opt-in. For example:
-
-```bash
-python sota-implementations/dreamer_v3/train.py \
-  optimization.checkpoint_dir=checkpoints \
-  optimization.checkpoint_every=1000 \
-  optimization.checkpoint_include_replay=true
-```
-
-`checkpoint_every` counts completed learner updates; a save happens after the
-current training batch. Set it to `null` to save only on completion or graceful
-termination. `checkpoint_keep_last=2` controls retention. Checkpoint directory
-names use the cumulative action count. The default `checkpoint_dir=null`
-disables saving, and replay is excluded unless explicitly enabled.
-
-Resume explicitly from a checkpoint or a rotation directory:
-
-```bash
-python sota-implementations/dreamer_v3/train.py \
-  optimization.resume_from=checkpoints \
-  optimization.checkpoint_dir=checkpoints \
-  collector.total_frames=10000
-```
-
-The frame budget is cumulative, so increase it to continue a completed run.
-Elapsed time also resumes from the saved value; increase `optimization.max_time`
-when continuing a run that reached its time budget. The environment count,
-replay capacity, batch/sequence sizes and sampling mode must match the saved
-configuration. Model shapes must remain compatible with the saved state.
-
-TorchRL checkpoint utilities save the learner (including normalization and
-slow-value parameters), optimizer, target-update state, global and replay RNGs,
-policy RNG counter, update-ratio remainder, reporting counters, unfinished
-logging window, logger identity and resolved configuration. Optional native
-replay serialization includes writer generations, streaming sampler state and
-queued prefetched samples. Async collection pauses and pending replay operations
-finish before the snapshot. CUDA work is synchronized before saving.
-
-A resumed process performs compile/capture warm-up before loading training state,
-then restores RNG state after constructing environments and loggers. JSONL and
-CSV logging append to their saved paths. W&B resumes the saved run ID with
-`resume="must"`; keep the same logger backend and service configuration.
-
-Environments restart. Saved unfinished replay tails become truncation boundaries
-before new transitions arrive, and incomplete episode returns restart at zero.
-Initial reset records are counted again when reset-record reporting is enabled.
-Queued collector results that were not emitted are not checkpointed. The acting
-policy is rebuilt from the restored learner; when using a separate policy RNG,
-its saved module state and counter are then restored. Consequently resumed
-trajectories are not promised to match an uninterrupted run. Without a replay payload,
-collection refills native replay before training continues, without accumulating
-a catch-up update burst. Counters and logger identity still continue.
-
-SIGINT and SIGTERM request a stop after the current collection/update batch.
-The final checkpoint is written before replay, environments and loggers close.
-Abrupt process termination cannot take a final snapshot; resume from the latest
-completed checkpoint instead.
-
-
-Checkpoint ownership is provided by core components: `DreamerV3Loss` stores
-learner and normalization state; `DreamerV3OptimizationStepper` stores optimizer
-and target-update progress. `DreamerV3SeededPolicy` and `DreamerV3UpdateRatio`
-serialize their own RNG counter and fractional scheduling progress. The recipe
-registers these objects with `Checkpoint` directly. Native replay closes restored
-stream tails through `ReplayBufferEnsemble.end_streams()`, and
-`get_logger(..., state_dict=saved_state)` owns logger identity and counter restoration.
+`optimization.max_time` stops a run after a wall-clock budget (with
+`collector.total_frames=-1` for an unbounded frame budget), and
+`logger.backend=wandb` mirrors every JSONL record to Weights & Biases
+(`logger.project`, `logger.entity`, `logger.exp_name`, and `logger.base_url` to
+pin the server when an imported library redirects `WANDB_BASE_URL`), including the collection
+rates, the inference-server statistics and the learner timings that the `train`
+records carry.
