@@ -6,10 +6,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import torch
 from tensordict import NestedKey, TensorDictBase
+from tensordict.utils import unravel_key
 
 
 def driver_step_for_action(
@@ -126,3 +127,44 @@ def replay_context_update(
             "belief": belief[_index_on(keep, belief.device)].float(),
         },
     )
+
+
+def insert_reset_records(
+    transitions: TensorDictBase,
+    observation_keys: Sequence[NestedKey],
+) -> TensorDictBase:
+    """Prepend a reset record to the first transition of every episode.
+
+    The reset record carries ``is_init=True``, a zero action, zero state and
+    belief, no reward or termination, and the episode's first observation
+    under ``("next", ...)``, so the learner encodes the reset observation from
+    a zero state exactly like the acting policy did. The first real transition
+    then loses its ``is_init`` flag. Records keep their per-environment order.
+    """
+    transitions = transitions.reshape(-1)
+    is_init = transitions.get("is_init").reshape(-1)
+    if not bool(is_init.any()):
+        return transitions
+    first_indices = is_init.nonzero().reshape(-1)
+    first = transitions[first_indices]
+    reset = first.clone()
+    for key in ("action", "state", "belief"):
+        reset.set(key, torch.zeros_like(first.get(key)))
+    for key in observation_keys:
+        key = unravel_key(key)
+        if key[0] != "next":
+            raise ValueError(f"Expected a ('next', ...) observation key, got {key}.")
+        reset.set(key, first.get(key[1:]))
+    reset.set(("next", "reward"), torch.zeros_like(first.get(("next", "reward"))))
+    for key in ("done", "terminated", "truncated"):
+        if ("next", key) in first.keys(True, True):
+            reset.set(("next", key), torch.zeros_like(first.get(("next", key))))
+    cleared = transitions.get("is_init").clone()
+    cleared.reshape(-1)[first_indices] = False
+    transitions = transitions.clone(recurse=False)
+    transitions.set("is_init", cleared)
+    positions = torch.arange(transitions.numel()) + is_init.long().cumsum(0)
+    reset_positions = positions[first_indices] - 1
+    merged = torch.cat([transitions, reset], 0)
+    order = torch.cat([positions, reset_positions]).argsort()
+    return merged[order]

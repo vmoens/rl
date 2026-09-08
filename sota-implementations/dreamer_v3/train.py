@@ -43,7 +43,11 @@ from dreamer_v3_agent import (
     make_env,
     make_primed_env,
 )
-from dreamer_v3_replay import collector_action_budget, replay_context_update
+from dreamer_v3_replay import (
+    collector_action_budget,
+    insert_reset_records,
+    replay_context_update,
+)
 from dreamer_v3_utils import (
     append_jsonl,
     eval_episode_reward,
@@ -586,6 +590,14 @@ def _build_collection(
         keep_rewards=False,
         keep_dones=False,
     )
+
+    if collector_backend == "async":
+        select_replay_keys = replay_postproc
+
+        def replay_postproc(transitions):
+            return select_replay_keys(
+                insert_reset_records(transitions, observation_keys)
+            )
 
     collector_kwargs = {
         "frames_per_batch": cfg.collector.frames_per_batch,
