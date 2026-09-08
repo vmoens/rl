@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import functools as ft
+import gc
 import math
 import signal
 from collections.abc import Callable
@@ -1117,6 +1118,12 @@ def main(cfg: DictConfig):
             path = rotation.save(checkpoint, step=action_step, components=components)
             torchrl_logger.info("Saved DreamerV3 checkpoint to %s", path)
 
+    # Setup leaves a large heap (compiled learner, collector, replay) that
+    # every full collection re-traverses, while the collection loop below
+    # allocates enough (one unpickled transition per environment step) to
+    # schedule collections continuously. Freeze the setup objects so later
+    # collections only visit what the loop allocates.
+    gc.freeze()
     collection_timer = None
     # A process-hosted inference server starts from freshly built weights; the
     # first collected batch starts it, then it receives the learner's weights.
