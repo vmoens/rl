@@ -40,6 +40,8 @@ collector:
 
 replay_buffer:
   device: cpu  # null keeps replay on the training device
+  pin_memory: true  # pin CPU replay samples for the transfer to a CUDA learner
+  prefetch: 1  # sampled batches prepared ahead of the learner (null disables)
   buffer_size: 10000
   batch_size: 16
   seq_len: 16

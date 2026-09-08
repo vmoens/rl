@@ -769,8 +769,12 @@ def _build_replay(
         routing_dim=0 if cfg.collector.backend == "sync" else None,
         batch_size=cfg.replay_buffer.batch_size * sequence_records,
         generator=generator,
-        pin_memory=replay_device.type == "cpu" and device.type == "cuda",
-        prefetch=1,
+        pin_memory=(
+            replay_device.type == "cpu"
+            and device.type == "cuda"
+            and cfg.replay_buffer.pin_memory
+        ),
+        prefetch=cfg.replay_buffer.prefetch,
     )
 
 
