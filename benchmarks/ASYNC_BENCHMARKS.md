@@ -51,6 +51,16 @@ becomes public in #4272. They keep one environment per worker because that
 transport rejects grouped workers. The same workload and batching limits apply;
 these remain separate series alongside the grouped integrated curve.
 
+`async-process-slots-chunked` is the same direct-transport workload with
+`transition_chunk_size=64`: each environment process sends 64 consecutive
+transitions per message instead of one, so the driver concatenates whole chunks
+into each 256-transition batch rather than unpickling and stacking transitions
+one at a time. Compare it with `async-process-slots` to see what the driver's
+per-transition work costs; the series skips on revisions before the option
+exists. `bench_collectors.py --backends async-process-slot --replay-mode
+background --transition-chunk-size N` measures the same choice as replay-buffer
+write throughput.
+
 `test_async_collection_pixels_64_envs[mode]` adds a separate CUDA acceptance
 comparison for `async-shm` and `async-process-slots`: 64 environments, one per
 worker, with the same CNN plus two 1024-wide layers, one-millisecond environment

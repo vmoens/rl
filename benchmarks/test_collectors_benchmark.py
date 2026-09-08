@@ -70,6 +70,7 @@ class _ResetLatencyPixelEnv(PixelMockEnv):
         "async-shm-integrated",
         "async-shm-grouped",
         "async-process-slots",
+        "async-process-slots-chunked",
         pytest.param("async-shm-static", marks=pytest.mark.gpu),
         pytest.param("async-process-slots-static", marks=pytest.mark.gpu),
     ],
@@ -98,6 +99,12 @@ def _benchmark_async_collection_pixels(benchmark, mode, regime, *, num_envs=None
     use_process = mode.startswith("async-process-slots")
     if use_process and not hasattr(inference_server, "ProcessSlotTransport"):
         pytest.skip("Direct process slots are not available on this revision")
+    chunk_size = 64 if mode == "async-process-slots-chunked" else 1
+    if chunk_size > 1 and (
+        "transition_chunk_size"
+        not in inspect.signature(AsyncBatchedCollector).parameters
+    ):
+        pytest.skip("Chunked worker results are not available on this revision")
     integrated = mode == "async-shm-integrated"
     use_static = mode in ("async-shm-static", "async-process-slots-static") or (
         integrated and device != "cpu" and has_static
@@ -173,6 +180,8 @@ def _benchmark_async_collection_pixels(benchmark, mode, regime, *, num_envs=None
                     num_slots=num_envs,
                 )
                 config["service_backend"] = "process"
+                if chunk_size > 1:
+                    process_options["transition_chunk_size"] = chunk_size
             collector = AsyncBatchedCollector(
                 factories,
                 policy_factory=policy_factory,
@@ -219,6 +228,7 @@ def _benchmark_async_collection_pixels(benchmark, mode, regime, *, num_envs=None
             execution=(
                 f"{'graph' if use_static else 'eager'}; {group_size} envs/worker"
                 + ("; process acting" if use_process else "")
+                + (f"; {chunk_size} transitions/message" if chunk_size > 1 else "")
             ),
             num_envs=num_envs,
             frames_per_batch=frames_per_batch,
