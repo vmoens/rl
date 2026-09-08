@@ -8,13 +8,15 @@ from __future__ import annotations
 from typing import TypeAlias
 
 import torch
-from tensordict import TensorDictBase
+from tensordict import NestedKey, TensorDictBase
+from tensordict.utils import unravel_key
 
-from torchrl.data import LazyTensorStorage, ReplayBuffer, SliceSampler
+from torchrl.data import LazyTensorStorage, ReplayBuffer, RoundRobinWriter, SliceSampler
 
 ReplayIndex: TypeAlias = torch.Tensor | tuple[torch.Tensor, ...]
 ReplaySampleInfo: TypeAlias = dict[str, ReplayIndex]
 _REPLAY_CONTEXT_VALID_KEY = ("collector", "context_valid")
+_DEFAULT_OBSERVATION_KEYS: tuple[NestedKey, ...] = (("next", "observation"),)
 
 
 # --- Driver step accounting --------------------------------------------------
@@ -161,17 +163,24 @@ class DreamerV3ReplayPipeline:
         self._prefetched = replay_buffer.sample(return_info=True)
         return current
 
-    def apply_pending_context(self, replay_buffer: ReplayBuffer) -> None:
+    def apply_pending_context(
+        self, replay_buffer: ReplayBuffer | MultiStreamReplay
+    ) -> None:
         """Apply the previous refresh, after ``take`` samples the next batch."""
         if self._pending_context is not None:
             pending_info, pending_state, pending_belief = self._pending_context
-            _refresh_replay_context(
-                replay_buffer,
-                pending_info["index"],
-                pending_info["index_generation"],
-                pending_state,
-                pending_belief,
-            )
+            if isinstance(replay_buffer, MultiStreamReplay):
+                replay_buffer.refresh_context(
+                    pending_info, pending_state, pending_belief
+                )
+            else:
+                _refresh_replay_context(
+                    replay_buffer,
+                    pending_info["index"],
+                    pending_info["index_generation"],
+                    pending_state,
+                    pending_belief,
+                )
             self._pending_context = None
 
     def stage_context(
@@ -189,11 +198,33 @@ class DreamerV3ReplayPipeline:
 
 
 class DreamerV3ReplayRecordBuilder:
-    """Convert collector transitions into the replay stream."""
+    """Convert collector transitions into the replay stream.
 
-    def __init__(self, num_streams: int):
+    Args:
+        num_streams (int): Number of environment streams in the collector data.
+        observation_keys (tuple of NestedKey, optional): The ``("next", ...)``
+            observation entries copied into each record. Defaults to
+            ``(("next", "observation"),)``.
+    """
+
+    def __init__(
+        self,
+        num_streams: int,
+        observation_keys: tuple[NestedKey, ...] = _DEFAULT_OBSERVATION_KEYS,
+    ):
         self.num_streams = num_streams
+        self.observation_keys = tuple(unravel_key(key) for key in observation_keys)
+        for key in self.observation_keys:
+            if not isinstance(key, tuple) or key[0] != "next" or len(key) < 2:
+                raise ValueError(
+                    "Replay observation keys must be nested under 'next', got "
+                    f"{key!r}."
+                )
         self._started = False
+
+    @staticmethod
+    def _root_key(key: tuple[str, ...]) -> NestedKey:
+        return key[1] if len(key) == 2 else key[1:]
 
     def __call__(self, data: TensorDictBase) -> TensorDictBase:
         if self.num_streams == 1:
@@ -204,58 +235,71 @@ class DreamerV3ReplayRecordBuilder:
                 f"{tuple(data.shape)} for {self.num_streams} streams."
             )
 
-        records = []
         record_keys = (
             "action",
             "is_init",
             "state",
             "belief",
-            ("next", "observation"),
+            *self.observation_keys,
             ("next", "reward"),
             ("next", "done"),
             ("next", "terminated"),
         )
-        for time_index in range(data.shape[1]):
-            collector_step = data[:, time_index]
-            reset = collector_step.get("is_init").reshape(self.num_streams, -1).any(-1)
-            insert_reset = reset if self._started else torch.zeros_like(reset)
-            if insert_reset.any() and not insert_reset.all():
-                raise RuntimeError(
-                    "The 2D DreamerV3 replay stream requires synchronized episode "
-                    "resets across collector environments."
-                )
-
-            transition = collector_step.select(*record_keys, strict=True).clone()
-            # This record models the transition into next.observation, so it
-            # keeps its action; the separate reset record marks the reset.
-            transition.get("is_init").zero_()
-            transition.set(
-                _REPLAY_CONTEXT_VALID_KEY,
-                torch.ones_like(transition.get("is_init"), dtype=torch.bool),
+        num_steps = data.shape[1]
+        if not num_steps:
+            return data.select(*record_keys, strict=True).clone()
+        reset = data.get("is_init").reshape(self.num_streams, num_steps, -1).any(-1)
+        insert_reset = reset.any(0)
+        unsynchronized = insert_reset & ~reset.all(0)
+        if not self._started:
+            # The first record of the stream needs no reset record before it.
+            insert_reset = insert_reset.clone()
+            insert_reset[0] = False
+            unsynchronized = unsynchronized.clone()
+            unsynchronized[0] = False
+        if unsynchronized.any():
+            raise RuntimeError(
+                "The 2D DreamerV3 replay stream requires synchronized episode "
+                "resets across collector environments."
             )
+        self._started = True
 
-            if insert_reset.any():
-                reset_transition = transition.clone()
-                for key in (
-                    "action",
-                    "state",
-                    "belief",
-                    ("next", "reward"),
-                    ("next", "done"),
-                    ("next", "terminated"),
-                ):
-                    reset_transition.get(key).zero_()
-                reset_transition.get("is_init").fill_(True)
-                reset_transition.set(
-                    ("next", "observation"),
-                    collector_step.get("observation").clone(),
-                )
-                records.append(reset_transition)
+        transition = data.select(*record_keys, strict=True).clone()
+        # These records model the transitions into next.observation, so they
+        # keep their action; separate reset records mark the resets.
+        transition.get("is_init").zero_()
+        transition.set(
+            _REPLAY_CONTEXT_VALID_KEY,
+            torch.ones_like(transition.get("is_init"), dtype=torch.bool),
+        )
+        reset_steps = insert_reset.nonzero().squeeze(-1)
+        num_resets = reset_steps.numel()
+        if not num_resets:
+            return transition
 
-            records.append(transition)
-            self._started = True
+        reset_records = transition[:, reset_steps].clone()
+        for key in (
+            "action",
+            "state",
+            "belief",
+            ("next", "reward"),
+            ("next", "done"),
+            ("next", "terminated"),
+        ):
+            reset_records.get(key).zero_()
+        reset_records.get("is_init").fill_(True)
+        reset_sources = data[:, reset_steps]
+        for key in self.observation_keys:
+            reset_records.set(key, reset_sources.get(self._root_key(key)).clone())
 
-        return torch.stack(records, 1)
+        # Each reset record precedes the transition whose root observation it
+        # carries: transition t lands after the resets at or before t.
+        transition_positions = torch.arange(num_steps) + insert_reset.cumsum(0)
+        reset_positions = transition_positions[reset_steps] - 1
+        order = torch.empty(num_steps + num_resets, dtype=torch.long)
+        order[transition_positions] = torch.arange(num_steps)
+        order[reset_positions] = num_steps + torch.arange(num_resets)
+        return torch.cat([transition, reset_records], 1)[:, order]
 
 
 class DreamerV3ShiftedRecordExtender:
@@ -356,6 +400,122 @@ class DreamerV3ShiftedRecordExtender:
         return replay_indices
 
 
+class MultiStreamReplay:
+    """One single-stream replay buffer per environment stream.
+
+    Asynchronous collection delivers the transitions of each environment in
+    arrival order, with episode boundaries that differ across environments.
+    Each stream therefore gets its own record builder, ring storage and
+    sampler; a batch draws its sequences from the streams in proportion to
+    the windows they hold.
+
+    Args:
+        num_streams (int): Number of environment streams.
+        buffer_size (int): Records kept per stream.
+        slice_len (int): Records per sampled sequence (the sequence length
+            plus the extra context record).
+        num_sequences (int): Sequences per sampled batch.
+        online (bool): Serve the newest blocks of each stream before uniform
+            samples, see :class:`DreamerV3ReplaySampler`.
+        seed (int): Seed of the sampling streams.
+        device (torch.device): Storage device.
+        observation_keys (tuple of NestedKey, optional): See
+            :class:`DreamerV3ReplayRecordBuilder`.
+    """
+
+    def __init__(
+        self,
+        num_streams: int,
+        *,
+        buffer_size: int,
+        slice_len: int,
+        num_sequences: int,
+        online: bool,
+        seed: int,
+        device: torch.device,
+        observation_keys: tuple[NestedKey, ...] = _DEFAULT_OBSERVATION_KEYS,
+    ):
+        if num_streams < 1:
+            raise ValueError(f"num_streams must be positive, got {num_streams}.")
+        self.num_streams = num_streams
+        self.slice_len = slice_len
+        self.num_sequences = num_sequences
+        self.buffers = [
+            ReplayBuffer(
+                storage=LazyTensorStorage(max_size=buffer_size, ndim=1, device=device),
+                writer=RoundRobinWriter(track_generations=True),
+                sampler=DreamerV3ReplaySampler(slice_len=slice_len, online=online),
+                batch_size=slice_len,
+                generator=torch.Generator().manual_seed(seed + stream),
+            )
+            for stream in range(num_streams)
+        ]
+        self.builders = [
+            DreamerV3ReplayRecordBuilder(1, observation_keys)
+            for _ in range(num_streams)
+        ]
+        self._rng = torch.Generator().manual_seed(seed + num_streams)
+
+    def __len__(self) -> int:
+        return sum(len(buffer) for buffer in self.buffers)
+
+    def stream_lengths(self) -> list[int]:
+        return [len(buffer) for buffer in self.buffers]
+
+    @property
+    def num_sampleable_streams(self) -> int:
+        return sum(len(buffer) >= self.slice_len for buffer in self.buffers)
+
+    def extend_stream(self, stream: int, data: TensorDictBase) -> int:
+        """Append the collector transitions of one stream, returning the record count."""
+        records = self.builders[stream](data).reshape(-1)
+        buffer = self.buffers[stream]
+        indices = buffer.extend(records)
+        buffer.sampler.observe_extend(indices, buffer.storage)
+        return records.numel()
+
+    def sample(self, return_info: bool = True) -> tuple[TensorDictBase, dict]:
+        """Sample ``num_sequences`` sequences across the streams."""
+        weights = torch.tensor(
+            [max(len(buffer) - self.slice_len + 1, 0) for buffer in self.buffers],
+            dtype=torch.float,
+        )
+        if not weights.sum():
+            raise RuntimeError(f"No replay stream holds {self.slice_len} records yet.")
+        streams = torch.multinomial(
+            weights, self.num_sequences, replacement=True, generator=self._rng
+        )
+        counts = torch.bincount(streams, minlength=self.num_streams)
+        parts = []
+        infos = []
+        for stream in counts.nonzero().flatten().tolist():
+            count = int(counts[stream])
+            data, info = self.buffers[stream].sample(
+                batch_size=count * self.slice_len, return_info=True
+            )
+            parts.append(data)
+            infos.append((stream, count, info))
+        data = torch.cat(parts, 0)
+        if not return_info:
+            return data
+        return data, {"streams": infos}
+
+    def refresh_context(
+        self, info: dict, state: torch.Tensor, belief: torch.Tensor
+    ) -> None:
+        """Write refreshed latents back, one stream at a time."""
+        offset = 0
+        for stream, count, part_info in info["streams"]:
+            _refresh_replay_context(
+                self.buffers[stream],
+                part_info["index"],
+                part_info["index_generation"],
+                state[offset : offset + count],
+                belief[offset : offset + count],
+            )
+            offset += count
+
+
 class DreamerV3ReplaySampler(SliceSampler):
     """Slice sampler that takes the oldest queued blocks before uniform ones."""
 
@@ -388,15 +548,23 @@ class DreamerV3ReplaySampler(SliceSampler):
             )
 
         max_time = storage._max_size_along_dim0()
-        for coordinate_row in coordinates:
-            self._stream_lengths.add_(1)
-            enqueue = (self._stream_lengths > self.slice_len) & (
-                (self._stream_lengths - 1).remainder(self.slice_len) == 0
+        num_rows = coordinates.shape[0]
+        if not num_rows:
+            return
+        # Every stream grows by one record per row, so the stream lengths stay
+        # equal: a row completes a block when the shared length passes a
+        # multiple of slice_len.
+        lengths = self._stream_lengths[0] + torch.arange(1, num_rows + 1)
+        completes_block = (lengths > self.slice_len) & (
+            (lengths - 1).remainder(self.slice_len) == 0
+        )
+        self._stream_lengths.add_(num_rows)
+        if completes_block.any():
+            starts = coordinates[completes_block].clone()
+            starts[..., 0].sub_(self.slice_len - 1).remainder_(max_time)
+            self._online_queue.extend(
+                starts.reshape(-1, coordinates.shape[-1]).unbind(0)
             )
-            if enqueue.any():
-                starts = coordinate_row[enqueue].clone()
-                starts[:, 0].sub_(self.slice_len - 1).remainder_(max_time)
-                self._online_queue.extend(starts.unbind(0))
 
     def _drop_stale_online(self, storage: LazyTensorStorage, seq_length: int) -> None:
         """Drop queued starts whose ``seq_length`` window is no longer stored."""

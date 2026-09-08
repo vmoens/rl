@@ -131,4 +131,53 @@ time and graph size, while `1` disables manual unrolling.
 `optimization.cudagraph_train_step=true` captures the learner forward and
 backward after five warmup calls. It requires CUDA and fixed input shapes;
 optimizer and target-network steps remain outside capture so their schedules
-continue to advance normally.
+continue to advance normally. With either option on, the learner step is
+compiled and captured on a spec-shaped fake batch before collection starts
+(`optimization.compile_warmup`, on by default in that case); parameters,
+normalizer statistics and target networks are restored afterwards, and the
+optimizer does not step. Compiling while the asynchronous collector runs would
+otherwise share the interpreter with its threads and idle the environments for
+the whole compile.
+
+## Images, discrete actions and asynchronous collection
+
+The script also trains from images, from a flat vector, or from both. `env.vector_key`
+names the flat observation (symlog MLP encoder, symlog squared-error decoder) and
+`env.pixels_key` a channels-first `uint8` image (`DreamerV3ImageEncoder` /
+`DreamerV3ImageDecoder`, squared error on the image divided by 255, sized by
+`networks.image_*`). A `OneHot` action spec selects a categorical actor with the
+reference's 1% uniform mixture; continuous actions keep the tanh-normal actor.
+
+`env.backend=custom` plugs in any environment through an import path,
+`env.factory=package.module:function`, called as
+`factory(seed=..., env_index=..., num_envs=..., **env.factory_kwargs)` and
+followed by the usual `StepCounter` and `InitTracker`.
+
+`collector.backend=async` replaces the synchronous `Collector` with an
+`AsyncBatchedCollector`: `collector.num_envs` environments step independently in
+their own processes (`collector.env_backend`) while an inference server on
+`collector.policy_device` batches the policy calls
+(`collector.inference_max_batch_size`, `collector.inference_timeout`). Since the
+environments no longer share a time axis, replay keeps one ring per environment
+(`replay_buffer.buffer_size` records each) and batches draw their sequences across
+the rings. `collector.max_pending_frames` bounds the frames waiting for the
+learner so environments pause when it lags, like a samples-per-insert limiter;
+`optimization.deferred_policy_sync=true` is required because the server owns a
+copy of the policy that is refreshed between batches. Environments that expose a
+boolean `env.milestone_key` vector have its flags logged at the end of every
+episode under `env.milestone_names`.
+
+`optimization.collection_warmup_seconds` delays the first update so the
+environments and the inference server run unthrottled for that long, which
+measures their throughput before the train ratio couples collection to the
+learner; `collector.compile_policy=true` compiles the acting policy and traces
+it for the served batch sizes before collection starts, falling back to the
+eager policy if compilation fails.
+
+`optimization.max_time` stops a run after a wall-clock budget (with
+`collector.total_frames=-1` for an unbounded frame budget), and
+`logger.backend=wandb` mirrors every JSONL record to Weights & Biases
+(`logger.project`, `logger.entity`, `logger.exp_name`, and `logger.base_url` to
+pin the server when an imported library redirects `WANDB_BASE_URL`), including the collection
+rates, the inference-server statistics and the learner timings that the `train`
+records carry.
