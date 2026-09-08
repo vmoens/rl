@@ -685,6 +685,28 @@ def _build_collection(
     return collector, behavior_policy_sync
 
 
+class _StoredInitMixin:
+    """Keep the collector's episode-start flags only.
+
+    The slice samplers also mark every slice start with ``is_init=True`` so
+    that recurrent modules restart from the stored hidden state there. The
+    RSSM rollout reads ``is_init`` as an episode reset and zeroes its state,
+    belief and action instead, which would train every sequence from a
+    zero state while the acting policy carries its state for whole episodes.
+    """
+
+    def _maybe_emit_init_marker(self, info, st_index, num_slices, seq_length, target_seq_length):
+        return None
+
+
+class _StoredInitStreamingSliceSampler(_StoredInitMixin, StreamingSliceSampler):
+    pass
+
+
+class _StoredInitSliceSampler(_StoredInitMixin, SliceSampler):
+    pass
+
+
 def _build_replay(
     cfg: DictConfig,
     num_envs: int,
@@ -703,7 +725,11 @@ def _build_replay(
             "sequence per stream."
         )
 
-    sampler_type = StreamingSliceSampler if cfg.replay_buffer.online else SliceSampler
+    sampler_type = (
+        _StoredInitStreamingSliceSampler
+        if cfg.replay_buffer.online
+        else _StoredInitSliceSampler
+    )
     members = [
         TensorDictReplayBuffer(
             storage=LazyTensorStorage(capacity, device=replay_device),
