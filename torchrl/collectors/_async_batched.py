@@ -29,9 +29,11 @@ from torchrl._utils import (
     timeit,
 )
 from torchrl.collectors._base import BaseCollector
+from torchrl.collectors._constants import DEFAULT_EXPLORATION_TYPE
 from torchrl.data.utils import CloudpickleWrapper
 from torchrl.envs import AsyncEnvPool, EnvBase, EnvCreator
 from torchrl.envs.async_envs import _validate_cpu_affinity
+from torchrl.envs.utils import ExplorationType
 from torchrl.modules.inference_server import (
     InferenceDeviceConfig,
     InferenceServer,
@@ -448,6 +450,15 @@ class AsyncBatchedCollector(BaseCollector):
             start of every collection batch.  Defaults to ``False``.
         postproc (Callable, optional): post-processing transform applied to
             each collected batch before yielding.  Defaults to ``None``.
+        exploration_type (ExplorationType, optional): interaction mode used
+            when collecting data, one of
+            ``torchrl.envs.utils.ExplorationType.RANDOM``, ``MODE``, ``MEAN``
+            or ``DETERMINISTIC``. Every inference request is stamped with it
+            and, when ``static_batch_size`` is set, the CUDA graph is captured
+            under it, independently of the process-wide
+            :func:`~torchrl.envs.utils.set_exploration_type` context, which a
+            learner thread of the same process may change at any time.
+            Defaults to ``ExplorationType.RANDOM``.
         yield_completed_trajectories (bool, optional): if ``True``, the
             collector yields individual completed trajectories as they finish
             rather than fixed-size batches.  ``frames_per_batch`` acts as the
@@ -529,6 +540,7 @@ class AsyncBatchedCollector(BaseCollector):
         ) = None,
         reset_at_each_iter: bool = False,
         postproc: Callable[[TensorDictBase], TensorDictBase] | None = None,
+        exploration_type: ExplorationType = DEFAULT_EXPLORATION_TYPE,
         yield_completed_trajectories: bool = False,
         weight_sync=None,
         weight_sync_model_id: str = "policy",
@@ -756,6 +768,11 @@ class AsyncBatchedCollector(BaseCollector):
         self.reset_at_each_iter = reset_at_each_iter
         self.yield_completed_trajectories = yield_completed_trajectories
         self._postproc = postproc
+        self.exploration_type = ExplorationType(
+            exploration_type
+            if exploration_type is not None
+            else DEFAULT_EXPLORATION_TYPE
+        )
         self.verbose = verbose
 
         self._frames = 0
@@ -798,11 +815,15 @@ class AsyncBatchedCollector(BaseCollector):
                         PolicyClientModule(
                             self._transport.client(),
                             max_inflight=self._max_inflight_per_env,
+                            interaction_type=self.exploration_type,
                         )
                         for _ in range(self._num_envs)
                     ]
                 if self._server.static_batch_size is not None:
-                    self._server.prepare_cudagraph(self._transport._request_slots[0])
+                    self._server.prepare_cudagraph(
+                        self._transport._request_slots[0],
+                        interaction_type=self.exploration_type,
+                    )
                 if not self._server.is_alive:
                     self._server.start()
 
@@ -898,13 +919,16 @@ class AsyncBatchedCollector(BaseCollector):
                     PolicyClientModule(
                         self._transport.client(),
                         max_inflight=self._max_inflight_per_env,
+                        interaction_type=self.exploration_type,
                     )
                     for _ in range(self._num_envs)
                 ]
 
             if self._server.static_batch_size is not None:
                 request_spec = self._env_pool.fake_tensordict()[0]
-                self._server.prepare_cudagraph(request_spec)
+                self._server.prepare_cudagraph(
+                    request_spec, interaction_type=self.exploration_type
+                )
 
             # Start inference server
             if not self._server.is_alive:
