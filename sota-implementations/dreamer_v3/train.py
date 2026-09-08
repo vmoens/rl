@@ -1210,15 +1210,16 @@ def main(cfg: DictConfig):
                     batch_losses[update_index].copy_(update_losses)
                     loss_window_sum += update_losses
                     loss_window_updates += 1
-                with timeit("dreamer_v3/replay_submit"):
-                    index, generation, patch = replay_context_update(
-                        sample_info, refreshed_state, refreshed_belief
-                    )
-                    rb.submit_update_if_present(
-                        index=index,
-                        generation=generation,
-                        patch=patch,
-                    )
+                if cfg.replay_buffer.context_writeback:
+                    with timeit("dreamer_v3/replay_submit"):
+                        index, generation, patch = replay_context_update(
+                            sample_info, refreshed_state, refreshed_belief
+                        )
+                        rb.submit_update_if_present(
+                            index=index,
+                            generation=generation,
+                            patch=patch,
+                        )
                 update_step += 1
 
             if isinstance(collector, AsyncBatchedCollector):

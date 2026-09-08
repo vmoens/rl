@@ -44,6 +44,8 @@ replay_buffer:
   batch_size: 16
   seq_len: 16
   online: true
+  # Bench switch: write the learner's posterior latents back into replay.
+  context_writeback: true
   warmup_factor: 2  # collect (warmup_factor * batch_size * seq_len) frames before training
 
 networks:
