@@ -19,6 +19,7 @@ Usage::
 from __future__ import annotations
 
 import copy
+import json
 import functools as ft
 import gc
 import math
@@ -719,6 +720,40 @@ class _StoredInitSliceSampler(_StoredInitMixin, SliceSampler):
     pass
 
 
+def _log_sample_integrity(update_step, host_sample, sample, device):
+    """Benchmark instrumentation: is the learner batch what the replay handed out?"""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    mismatched = []
+    for key, value in sample.items(True, True):
+        reference = host_sample.get(key)
+        if not torch.equal(value.cpu(), reference):
+            mismatched.append(str(key))
+    stats = {"update": update_step, "mismatched_keys": mismatched}
+    env_index = sample.get("env_index", None)
+    if env_index is not None:
+        flat = env_index.reshape(sample.shape[0], -1)
+        stats["env_index_constant"] = float((flat == flat[:, :1]).all(-1).float().mean())
+    action = sample.get("action")
+    stats["action_onehot_ok"] = float((action.sum(-1) == 1).float().mean())
+    stats["is_init_rate"] = float(sample.get("is_init").float().mean())
+    stats["done_rate"] = float(sample.get(("next", "done")).float().mean())
+    stats["terminated_rate"] = float(sample.get(("next", "terminated")).float().mean())
+    reward = sample.get(("next", "reward"))
+    stats["reward_nonzero_rate"] = float((reward != 0).float().mean())
+    stats["reward_min_max"] = [float(reward.min()), float(reward.max())]
+    for key in sample.keys(True, True):
+        if isinstance(key, tuple) and key[0] == "next" and sample.get(key).dtype == torch.uint8:
+            pixels = sample.get(key).float()
+            step_diff = (pixels[:, 1:] - pixels[:, :-1]).abs().mean((-1, -2, -3))
+            stats["pixels_mean"] = float(pixels.mean())
+            stats["pixels_step_absdiff_mean"] = float(step_diff.mean())
+            stats["pixels_step_absdiff_max"] = float(step_diff.max())
+    stats["state_norm_pos0"] = float(sample.get("state")[:, 0].norm(dim=-1).mean())
+    stats["belief_norm_pos0"] = float(sample.get("belief")[:, 0].norm(dim=-1).mean())
+    torchrl_logger.info("sample_integrity %s", json.dumps(stats))
+
+
 def _build_replay(
     cfg: DictConfig,
     num_envs: int,
@@ -1246,6 +1281,10 @@ def main(cfg: DictConfig):
                     sample_info = replay_sample.select("index", "index_generation")
                     sample = replay_sample.exclude("index", "index_generation")
                     sample = sample.to(device, non_blocking=True)[:, :-1]
+                    if update_step % 50 == 0:
+                        _log_sample_integrity(
+                            update_step, replay_sample[:, :-1], sample, device
+                        )
                 with timeit(
                     "dreamer_v3/train_update", sync=cfg.optimization.sync_timers
                 ):
