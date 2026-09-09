@@ -244,7 +244,7 @@ def _make_learner_update(
 
 
 def _learner_metrics(losses: TensorDictBase) -> torch.Tensor:
-    """Select the six loss series recorded by this experiment."""
+    """Select the loss and actor series recorded by this experiment."""
     return torch.stack(
         (
             losses["loss_model_dynamic"] + losses["loss_model_representation"],
@@ -253,6 +253,8 @@ def _learner_metrics(losses: TensorDictBase) -> torch.Tensor:
             losses["loss_actor"],
             losses["loss_value"],
             losses["replay_value"],
+            losses["actor_entropy"],
+            losses["return_scale"],
         )
     )
 
@@ -869,6 +871,8 @@ def _log_train_window(
                         "loss_actor",
                         "loss_value",
                         "loss_replay_value",
+                        "actor_entropy",
+                        "return_scale",
                     ),
                     (loss_window_sum / max(loss_window_updates, 1)).cpu().tolist(),
                 )
@@ -1106,7 +1110,7 @@ def main(cfg: DictConfig):
     history_eval: list[torch.Tensor] = []
     loss_history: list[torch.Tensor] = []
     loss_window_sum = torch.tensor(
-        run_state.get("loss_window_sum", [0.0] * 6), device=device
+        run_state.get("loss_window_sum", [0.0] * 8), device=device
     )
     loss_window_updates = int(run_state.get("loss_window_updates", 0))
     record_loss_history = plot_enabled(cfg)
@@ -1271,7 +1275,7 @@ def main(cfg: DictConfig):
                 # Stage one time per batch; more updates keep the pending snapshot.
                 behavior_policy_sync.stage_before_training()
 
-            batch_losses = torch.empty((batch_updates, 6), device=device)
+            batch_losses = torch.empty((batch_updates, 8), device=device)
             for update_index in range(batch_updates):
                 with timeit("dreamer_v3/replay_sample"):
                     replay_sample = rb.sample().reshape(
