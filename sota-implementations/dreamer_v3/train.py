@@ -77,8 +77,18 @@ from tensordict.nn import CudaGraphModule, TensorDictModuleBase
 from torchrl import timeit
 from torchrl._utils import get_available_device, logger as torchrl_logger
 from torchrl.collectors import AsyncBatchedCollector, Collector
-from torchrl.data import LazyTensorStorage, OneHot, ReplayBuffer, RoundRobinWriter
-from torchrl.envs import EnvBase, SerialEnv
+from torchrl.data import (
+    LazyTensorStorage,
+    OneHot,
+    ReplayBuffer,
+    ReplayBufferEnsemble,
+    RoundRobinWriter,
+    SliceSampler,
+    StreamingSliceSampler,
+    TensorDictReplayBuffer,
+    TensorDictRoundRobinWriter,
+)
+from torchrl.envs import EnvBase, SelectTransform, SerialEnv
 from torchrl.envs.utils import ExplorationType
 from torchrl.modules.inference_server import (
     InferenceDeviceConfig,
@@ -731,6 +741,82 @@ def _apply_behavior_sync(
         behavior_policy_sync.apply_after_action()
 
 
+class EnsembleReplayAdapter:
+    """Main's ReplayBufferEnsemble replay behind the MultiStreamReplay interface.
+
+    Hybrid benchmark: the 07 Sep training loop with main's replay path (per-stream
+    TensorDictReplayBuffer members, StreamingSliceSampler, round-robin writer with
+    generation tracking, pinned prefetched samples). The latent write-back is off.
+    """
+
+    def __init__(self, cfg, num_envs, replay_device, observation_keys):
+        device = torch.device(cfg.optimization.device)
+        sequence_records = cfg.replay_buffer.seq_len + 1
+        capacity = cfg.replay_buffer.buffer_size
+        sampler_type = StreamingSliceSampler if cfg.replay_buffer.online else SliceSampler
+        members = [
+            TensorDictReplayBuffer(
+                storage=LazyTensorStorage(capacity, device=replay_device),
+                sampler=sampler_type(slice_len=sequence_records, end_key=("next", "done")),
+                writer=TensorDictRoundRobinWriter(track_generations=True),
+            )
+            for _ in range(num_envs)
+        ]
+        generator = torch.Generator().manual_seed(stream_seed(cfg.env.seed, 0, REPLAY_RNG_STREAM))
+        self.rb = ReplayBufferEnsemble(
+            *members,
+            p="sampleable",
+            num_buffer_sampled=cfg.replay_buffer.batch_size,
+            routing_key="env_index",
+            batch_size=cfg.replay_buffer.batch_size * sequence_records,
+            generator=generator,
+            pin_memory=replay_device.type == "cpu" and device.type == "cuda",
+            prefetch=1,
+        )
+        self.num_envs = num_envs
+        self._select = SelectTransform(
+            "action",
+            "is_init",
+            "state",
+            "belief",
+            "env_index",
+            *observation_keys,
+            ("next", "reward"),
+            ("next", "done"),
+            ("next", "terminated"),
+            ("next", "truncated"),
+            keep_rewards=False,
+            keep_dones=False,
+        )
+
+    def extend_stream(self, stream, stream_data):
+        records = self._select(stream_data.reshape(-1))
+        self.rb.extend(records)
+        return records.numel()
+
+    @property
+    def num_sampleable_streams(self):
+        return self.num_envs if self.rb.can_sample() else 0
+
+    def __len__(self):
+        return int(self.rb.stats()["size"])
+
+    def sample(self, return_info=True):
+        sample = self.rb.sample().exclude("index", "index_generation")
+        return (sample, {}) if return_info else sample
+
+    def refresh_context(self, info, state, belief):
+        return None
+
+
+class _NoContextPipeline(DreamerV3ReplayPipeline):
+    def stage_context(self, *args, **kwargs):
+        return None
+
+    def apply_pending_context(self, replay_buffer):
+        return None
+
+
 def _build_replay(
     cfg: DictConfig,
     num_envs: int,
@@ -745,17 +831,8 @@ def _build_replay(
 ]:
     replay_pipeline = DreamerV3ReplayPipeline()
     if cfg.collector.backend == "async":
-        replay = MultiStreamReplay(
-            num_envs,
-            buffer_size=cfg.replay_buffer.buffer_size,
-            slice_len=cfg.replay_buffer.seq_len + 1,
-            num_sequences=cfg.replay_buffer.batch_size,
-            online=cfg.replay_buffer.online,
-            seed=stream_seed(cfg.env.seed, 0, REPLAY_RNG_STREAM) % 2**62,
-            device=replay_device,
-            observation_keys=observation_keys,
-        )
-        return replay, None, None, None, replay_pipeline
+        replay = EnsembleReplayAdapter(cfg, num_envs, replay_device, observation_keys)
+        return replay, None, None, None, _NoContextPipeline()
     replay_sampler = DreamerV3ReplaySampler(
         # The extra record receives the last refreshed posterior.
         slice_len=cfg.replay_buffer.seq_len + 1,
