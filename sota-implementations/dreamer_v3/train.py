@@ -752,6 +752,19 @@ def _log_sample_integrity(update_step, host_sample, sample, device):
             stats["pixels_step_absdiff_mean"] = float(step_diff.mean())
             stats["pixels_step_absdiff_max"] = float(step_diff.max())
     stats["state_norm_pos0"] = float(sample.get("state")[:, 0].norm(dim=-1).mean())
+    codes = action.argmax(-1)
+    stats["action_repeat_rate"] = float((codes[:, 1:] == codes[:, :-1]).float().mean())
+    stats["action_repeat2_rate"] = float((codes[:, 2:] == codes[:, :-2]).float().mean())
+    run_lengths = []
+    for row in codes:
+        change = torch.ones_like(row, dtype=torch.bool)
+        change[1:] = row[1:] != row[:-1]
+        run_lengths.append(float(row.numel() / max(int(change.sum()), 1)))
+    stats["action_mean_run_length"] = sum(run_lengths) / len(run_lengths)
+    counts = torch.bincount(codes.reshape(-1), minlength=action.shape[-1]).float()
+    probs = counts / counts.sum()
+    stats["action_entropy_nats"] = float(-(probs[probs > 0] * probs[probs > 0].log()).sum())
+    stats["action_top_share"] = float(probs.max())
     stats["belief_norm_pos0"] = float(sample.get("belief")[:, 0].norm(dim=-1).mean())
     torchrl_logger.info("sample_integrity %s", json.dumps(stats))
 
