@@ -92,6 +92,7 @@ from .tensordict_module import (
     GRUCell,
     GRUModule,
     LMHeadActorValueOperator,
+    LowLevelController,
     LSTM,
     LSTMCell,
     LSTMModule,
@@ -147,6 +148,7 @@ from .mcts import (  # usort:skip
 from .vla import LeRobotPolicyWrapper, TinyVLA, VLAWrapperBase  # usort:skip
 
 __all__ = [
+    "LowLevelController",
     "Actor",
     "DiffusionActor",
     "DreamerV3DiscreteActor",
