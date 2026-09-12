@@ -2730,17 +2730,15 @@ class TestMujoco:
         are aliases; both produce a :class:`ParallelEnv` of N copies."""
         env_a = HopperEnv(backend="mujoco", num_envs=2, seed=0)
         env_b = HopperEnv(backend="mujoco", num_workers=2, seed=0)
-        try:
-            assert isinstance(env_a, ParallelEnv)
-            assert isinstance(env_b, ParallelEnv)
-            assert env_a._metadata_from_workers
-            assert env_b._metadata_from_workers
-            assert env_a._use_buffers is False
-            assert env_b._use_buffers is False
-            assert env_a.batch_size == env_b.batch_size
-        finally:
-            env_a.close()
-            env_b.close()
+        # Lazy ParallelEnvs: the workers only start on the first reset, so
+        # there is nothing to close here.
+        assert isinstance(env_a, ParallelEnv)
+        assert isinstance(env_b, ParallelEnv)
+        assert not env_a._metadata_from_workers
+        assert not env_b._metadata_from_workers
+        assert env_a._use_buffers is not False
+        assert env_b._use_buffers is not False
+        assert env_a.batch_size == env_b.batch_size
 
     @pytest.mark.skipif(not _has_mujoco, reason="mujoco not installed")
     def test_mujoco_backend_rejects_both_envs_and_workers(self):
@@ -2759,6 +2757,14 @@ class TestMujoco:
     def test_mujoco_backend_parallel_rollout(self):
         env = HopperEnv(backend="mujoco", num_envs=2, seed=0)
         assert isinstance(env, ParallelEnv)
+        assert not env._metadata_from_workers
+        td = env.rollout(3)
+        assert env._use_buffers
+        assert torch.isfinite(td.get(("next", "reward"))).all()
+        env.close()
+        env = HopperEnv(
+            backend="mujoco", num_envs=2, seed=0, metadata_from_workers=True
+        )
         assert env._metadata_from_workers
         assert env._use_buffers is False
         td = env.rollout(3)

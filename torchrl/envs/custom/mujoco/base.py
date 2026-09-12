@@ -123,6 +123,7 @@ class _MujocoMeta(_EnvPostInit):
         *args,
         num_workers: int = 1,
         parallel: bool | None = None,
+        metadata_from_workers: bool = False,
         **kwargs,
     ):
         backend = kwargs.get("backend", getattr(cls, "DEFAULT_BACKEND", "mujoco-torch"))
@@ -168,8 +169,13 @@ class _MujocoMeta(_EnvPostInit):
                 for _ in range(n):
                     worker_kwargs.append({} if seed is None else {"seed": seed})
                     seed = None if seed is None else seed_generator(seed)
+                # Shared buffers are the fast path; metadata_from_workers
+                # trades them for skipping the parent-side construction, which
+                # only pays off for environments that are slow to build.
                 parallel_kwargs = (
-                    {"metadata_from_workers": True} if wrap_cls is ParallelEnv else {}
+                    {"metadata_from_workers": True}
+                    if wrap_cls is ParallelEnv and metadata_from_workers
+                    else {}
                 )
                 return wrap_cls(
                     n, _factory, create_env_kwargs=worker_kwargs, **parallel_kwargs
@@ -205,6 +211,11 @@ class MujocoEnv(EnvBase, abc.ABC, metaclass=_MujocoMeta):
             loaded as text and therefore must be self-contained.
         backend: ``"mujoco-torch"`` (default), ``"mjx"``, or ``"mujoco"``.
         num_envs: batch size; the env's ``batch_size`` is ``(num_envs,)``.
+            With ``backend="mujoco"`` and ``num_envs > 1`` (or ``num_workers``)
+            the copies run in a :class:`~torchrl.envs.ParallelEnv` with shared
+            buffers; ``metadata_from_workers=True`` lets the workers build the
+            env and report its specs instead, which skips the parent-side
+            construction but disables the shared buffers.
         device: torch device for observations / rewards / actions.
         seed: RNG seed for the reset noise distribution and any
             subclass-defined randomization (e.g. random target attitudes).
