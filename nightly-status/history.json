@@ -1,5 +1,5 @@
 {
-  "last_updated": "2026-09-20T10:12:39.575692+00:00",
+  "last_updated": "2026-09-20T20:10:18.570801+00:00",
   "stats": {
     "last_7_days": {
       "days": 7,
@@ -22,7 +22,7 @@
     {
       "date": "2026-09-20",
       "orchestrator_ran": true,
-      "orchestrator_status": "pending",
+      "orchestrator_status": "queued",
       "orchestrator_url": "https://github.com/vmoens/rl/actions/runs/35504268790",
       "orchestrator_run_id": 35504268790,
       "workflows": {
