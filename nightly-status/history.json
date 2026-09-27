@@ -1,36 +1,141 @@
 {
-  "last_updated": "2026-09-27T10:25:37.825553+00:00",
+  "last_updated": "2026-09-27T20:42:59.082909+00:00",
   "stats": {
     "last_7_days": {
       "days": 7,
-      "runs_with_data": 6,
-      "total_workflow_runs": 62,
-      "total_success": 54,
+      "runs_with_data": 7,
+      "total_workflow_runs": 71,
+      "total_success": 63,
       "total_failure": 8,
-      "success_rate": 87.1
+      "success_rate": 88.7
     },
     "last_30_days": {
       "days": 23,
-      "runs_with_data": 16,
-      "total_workflow_runs": 165,
-      "total_success": 144,
+      "runs_with_data": 17,
+      "total_workflow_runs": 174,
+      "total_success": 153,
       "total_failure": 21,
-      "success_rate": 87.3
+      "success_rate": 87.9
     }
   },
   "history": [
     {
       "date": "2026-09-27",
-      "orchestrator_ran": false,
-      "orchestrator_status": "not_run",
-      "orchestrator_url": null,
-      "workflows": {},
+      "orchestrator_ran": true,
+      "orchestrator_status": "queued",
+      "orchestrator_url": "https://github.com/vmoens/rl/actions/runs/36313968852",
+      "orchestrator_run_id": 36313968852,
+      "workflows": {
+        "test-linux.yml": {
+          "status": "skipped",
+          "conclusion": "skipped",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605073588",
+          "display_name": "Linux Tests"
+        },
+        "test-linux-llm.yml": {
+          "status": "skipped",
+          "conclusion": "skipped",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605073654",
+          "display_name": "LLM Tests"
+        },
+        "test-linux-habitat.yml": {
+          "status": "skipped",
+          "conclusion": "skipped",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605073513",
+          "display_name": "Habitat Tests"
+        },
+        "test-linux-tutorials.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605073978",
+          "display_name": "Tutorials Tests"
+        },
+        "test-linux-examples.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605074011",
+          "display_name": "Examples Tests"
+        },
+        "test-linux-sota.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605074034",
+          "display_name": "SOTA Tests"
+        },
+        "test-linux-libs.yml": {
+          "status": "skipped",
+          "conclusion": "skipped",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605073474",
+          "display_name": "Libs Tests"
+        },
+        "test-windows-optdepts.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605074362",
+          "display_name": "Windows Tests"
+        },
+        "lint.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605073877",
+          "display_name": "Lint"
+        },
+        "docs.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605074432",
+          "display_name": "Documentation"
+        },
+        "benchmarks.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605073376",
+          "display_name": "Benchmarks"
+        },
+        "validate-test-partitioning.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605073217",
+          "display_name": "Test Partitioning"
+        },
+        "nightly_build.yml": {
+          "status": "skipped",
+          "conclusion": "skipped",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605073942",
+          "display_name": "Nightly Build"
+        },
+        "build-wheels-linux.yml": {
+          "status": "success",
+          "conclusion": "success",
+          "url": "https://github.com/vmoens/rl/actions/runs/36313968852/job/108605074014",
+          "display_name": "Wheels (Linux)"
+        },
+        "build-wheels-m1.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Wheels (M1)"
+        },
+        "build-wheels-windows.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Wheels (Windows)"
+        },
+        "build-wheels-aarch64-linux.yml": {
+          "status": "skipped",
+          "conclusion": null,
+          "url": null,
+          "display_name": "Wheels (Aarch64)"
+        }
+      },
       "summary": {
-        "total": 0,
-        "success": 0,
+        "total": 17,
+        "success": 9,
         "failure": 0,
-        "skipped": 0,
-        "success_rate": null
+        "skipped": 8,
+        "other": 0,
+        "success_rate": 100.0
       }
     },
     {
